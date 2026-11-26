@@ -1,0 +1,14 @@
+# Config used only by the test harness (scripts/test.mjs and test/helpers/d1.ts):
+# the same D1 + R2 bindings as production, without Workflows (which cannot run outside workerd's Workflows engine).
+name = "lifehub-test"
+compatibility_date = "2026-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "lifehub-control"
+migrations_dir = "../migrations"
+
+[[r2_buckets]]
+binding = "DOCS_BUCKET"
+bucket_name = "lifehub-docs"
