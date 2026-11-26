@@ -20,3 +20,7 @@ jobs:
         run: npm run typecheck
       - name: Tests (real local D1 + R2 via wrangler / workerd)
         run: npm test
+      - name: Worker bundles (entrypoint, Workflow classes and bindings resolve)
+        run: npm run check:bundle
+        env:
+          WRANGLER_SEND_METRICS: "false"

@@ -6,6 +6,23 @@ compatibility_flags = ["nodejs_compat"]
 [observability]
 enabled = true
 
+# Non-secret configuration. Source code reads these from `env`; it never hardcodes the brand or the domain.
+# Secrets (KEK_B64, OPENAI_API_KEY, ANTHROPIC_API_KEY) are set with `wrangler secret put`, never here.
+[vars]
+APP_NAME = "Keel"
+INBOUND_DOMAIN = "in.lifehub.app"
+
+# Durable ingestion pipelines (classes are exported from src/index.ts).
+[[workflows]]
+name = "ingest-email"
+binding = "INGEST_EMAIL_WF"
+class_name = "IngestEmailWF"
+
+[[workflows]]
+name = "ingest-file"
+binding = "INGEST_FILE_WF"
+class_name = "IngestFileWF"
+
 # Control + tenancy DB. Shard DBs (shard_00..03) are added as extra [[d1_databases]] bindings
 # when the repository layer lands; writeFact() already takes the target D1Database as an argument.
 # database_id is intentionally omitted: local dev and `wrangler d1 migrations apply DB --local` need none, and

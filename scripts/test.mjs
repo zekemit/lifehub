@@ -1,5 +1,5 @@
 // npm test: applies migrations to a fresh LOCAL D1 (miniflare/workerd), bundles test/*.test.ts and runs them with node:test.
-// Usage: npm test [-- <substring of a test file name>]
+// Usage: npm test [-- <substring of a test file name>]   (TEST_NAME=<regex> npm test narrows to matching test names)
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -41,7 +41,7 @@ try {
   code = await new Promise((resolve) => {
     const child = spawn(
       process.execPath,
-      ['--enable-source-maps', '--test', '--test-concurrency=1', '--test-timeout=180000', ...files.map((f) => join(bundles, f.replace(/\.ts$/, '.mjs')))],
+      ['--enable-source-maps', '--test', '--test-concurrency=1', '--test-timeout=180000', ...(process.env.TEST_NAME ? ['--test-name-pattern', process.env.TEST_NAME] : []), ...files.map((f) => join(bundles, f.replace(/\.ts$/, '.mjs')))],
       { stdio: 'inherit', env: { ...process.env, STATE_DIR: join(state, 'v3'), PROJECT_ROOT: process.cwd() } },
     );
     child.on('exit', (c) => resolve(c ?? 1));

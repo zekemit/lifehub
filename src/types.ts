@@ -28,6 +28,49 @@ export interface Env {
   DB: D1Database;
   /** R2 bucket holding encrypted raw documents (wrangler.toml binding "DOCS_BUCKET"). */
   DOCS_BUCKET: R2Bucket;
+  /** Product name for user-facing text (wrangler.toml [vars]). Never hardcode it in source. */
+  APP_NAME: string;
+  /** Domain of the inbound drop addresses, e.g. the part after '@' (wrangler.toml [vars]). Never hardcode it. */
+  INBOUND_DOMAIN: string;
+  /** Cloudflare Workflows bindings (wrangler.toml [[workflows]]). */
+  INGEST_EMAIL_WF: Workflow<IngestEmailParams>;
+  INGEST_FILE_WF: Workflow<IngestFileParams>;
+  /** Secrets (`wrangler secret put`): 32-byte base64 key-encryption key, and the two LLM provider keys. */
+  KEK_B64: string;
+  OPENAI_API_KEY: string;
+  ANTHROPIC_API_KEY: string;
+}
+
+/** Payload of an IngestEmailWF instance. The raw MIME is already encrypted in R2 at `r2_key`. */
+export interface IngestEmailParams {
+  household_id: string;
+  r2_key: string;
+  /** sha256 (hex) of the raw MIME bytes. */
+  sha256: string;
+  size_bytes: number;
+  /** SMTP envelope sender (lower-cased). */
+  envelope_from: string;
+}
+
+export type SignConvention = 'negative_is_outflow' | 'positive_is_outflow' | 'auto';
+
+/** Payload of an IngestFileWF instance. The raw upload is already encrypted in R2 at `r2_key`. */
+export interface IngestFileParams {
+  household_id: string;
+  r2_key: string;
+  file_name: string;
+  /** 'csv' = bank / card / Monarch export; 'pdf_text' = text already extracted from a PDF statement. */
+  kind: 'csv' | 'pdf_text';
+  /** sha256 (hex) of the raw file bytes. */
+  sha256: string;
+  /** Card the file belongs to, when the file itself does not say (bank/card CSV without an account column). */
+  default_card_entity_id?: string | null;
+  /** Default 'auto'. Amex-style exports (positive = charge) are detected automatically. */
+  sign_convention?: SignConvention;
+  /** Year for statement lines that only carry MM/DD. Default: derived from `as_of`. */
+  statement_year?: number | null;
+  /** Reference "now" for the run (ISO). Default: the workflow clock. */
+  as_of?: IsoTimestamp;
 }
 
 /** Canonical UTC ISO-8601 timestamp with milliseconds, e.g. "2026-11-26T08:30:00.000Z". */
@@ -179,7 +222,7 @@ export type LedgerReason = (typeof LEDGER_REASONS)[number];
 export interface HouseholdRow {
   household_id: string;
   shard: number;
-  /** Local part of the drop address: h_<10 base32>  (full address: <alias_local>@in.lifehub.app). */
+  /** Local part of the drop address: h_<10 base32>  (full address: <alias_local>@<INBOUND_DOMAIN>). */
   alias_local: string;
   /** IANA time zone, default 'America/New_York'. */
   timezone: string;
