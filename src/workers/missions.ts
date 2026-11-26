@@ -11,7 +11,8 @@
  * Every lookup is scoped by the authenticated household; a run id from another household answers 404, never 403.
  */
 
-import { creditBalance } from '../missions/ledger';
+import { autoRechargeAllowed, autoRechargeSettings } from '../billing/autoRecharge';
+import { creditBalance } from '../billing/credits';
 import { getRun, transitionRun, type RunRecord } from '../missions/runState';
 import { isAllowedPushEndpoint } from '../notify/webPush';
 import type { Env } from '../types';
@@ -21,6 +22,16 @@ import { error, isAlreadyExists, json } from './http';
 const RUN_ID = /^run_[0-9a-f]{32}$/;
 /** States in which MissionRunWF is already running (or has finished) for a run. */
 const STARTED_STATES = ['COMPILED', 'R0_READ', 'GATED', 'R2_AWAITING', 'R2_APPROVED', 'R3_LINK_ISSUED', 'CONFIRMED', 'FAILED_GATE', 'CANCELED'];
+
+/**
+ * The Workflow that owns a run, and its instance id. Most runs belong to MissionRunWF under their own id; a drop alarm's run lives inside
+ * its DropAlarmWF instance; a run restarted after a top-up lives in a newer MissionRunWF instance (`<run_id>~<attempt>`).
+ */
+function workflowOf(env: Env, run: RunRecord): { binding: Workflow<unknown>; id: string } {
+  const instance = typeof run.params['workflow_instance'] === 'string' ? run.params['workflow_instance'] : run.run_id;
+  const binding = run.params['workflow'] === 'drop_alarm' ? env.DROP_ALARM_WF : env.MISSION_RUN_WF;
+  return { binding: binding as Workflow<unknown>, id: instance };
+}
 
 export function parseMissionPath(path: string): { run_id: string; action: 'start' | 'approve' | 'decline' | 'confirm' } | null {
   const m = /^\/api\/missions\/([^/]+)\/(start|approve|decline|confirm)$/.exec(path);
@@ -40,17 +51,38 @@ async function readJson(request: Request): Promise<Record<string, unknown> | nul
 const stateOf = (run: RunRecord): string => run.state;
 
 async function start(env: Env, auth: Auth, run: RunRecord, now: Date): Promise<Response> {
-  if (STARTED_STATES.includes(run.state)) return json(200, { status: 'already_started', run_id: run.run_id, state: stateOf(run) });
-  if (run.state !== 'R1_STAGED') return error(409, 'not_startable', `A card in state ${run.state} cannot be started.`);
+  // a run another Workflow owns (a drop alarm's card) is already running there
+  if (typeof run.params['workflow'] === 'string' || STARTED_STATES.includes(run.state)) return json(200, { status: 'already_started', run_id: run.run_id, state: stateOf(run) });
+  if (run.state !== 'R1_STAGED' && run.state !== 'INSUFFICIENT_CREDITS') return error(409, 'not_startable', `A card in state ${run.state} cannot be started.`);
   if (run.expires_at !== null && Date.parse(run.expires_at) < now.getTime()) return error(409, 'expired', 'This card has expired.');
   const tpl = await env.DB.prepare('SELECT max_tier, credits_cost FROM mission_templates WHERE template_key = ? AND version = ?')
     .bind(run.template_key, run.template_version)
     .first<{ max_tier: string; credits_cost: number }>();
   if (tpl === null || tpl.max_tier === 'R1') return error(409, 'not_runnable', 'This card has no action to run.');
   const balance = await creditBalance(env.DB, auth.household_id);
-  if (balance < tpl.credits_cost) return error(402, 'insufficient_credits', 'You are out of credits.');
+  if (balance < tpl.credits_cost) {
+    // short of credits: the run may still go ahead if the household opted in to auto-recharge and it is allowed right now
+    const auto = await autoRechargeSettings(env.DB, auth.household_id, now);
+    if (auto === null || !autoRechargeAllowed(auto).ok) {
+      return json(402, { error: 'insufficient_credits', message: 'You are out of credits.', balance, needed: tpl.credits_cost, top_up: '/api/credits/checkout' });
+    }
+  }
+  // a run halted for credits starts again as a NEW Workflow instance (the first one has finished). If the newest instance is
+  // already running (it started after the halt we are looking at, but has not moved the run on yet), a second tap starts nothing.
+  const startedAttempt = typeof run.params['attempt'] === 'number' ? run.params['attempt'] : 0;
+  const failure = run.params['failure'] as { attempt?: unknown } | null | undefined;
+  const haltedAttempt = typeof failure?.attempt === 'number' ? failure.attempt : 0;
+  if (run.state === 'INSUFFICIENT_CREDITS' && startedAttempt > haltedAttempt) return json(200, { status: 'already_started', run_id: run.run_id, state: stateOf(run) });
+  const attempt = run.state === 'INSUFFICIENT_CREDITS' ? startedAttempt + 1 : 0;
+  const instance = attempt === 0 ? run.run_id : `${run.run_id}~${attempt}`;
+  if (attempt > 0) {
+    await env.DB
+      .prepare('UPDATE mission_runs SET params_json = json_patch(params_json, ?), updated_at = ? WHERE run_id = ? AND household_id = ?')
+      .bind(JSON.stringify({ attempt, workflow_instance: instance }), now.toISOString(), run.run_id, auth.household_id)
+      .run();
+  }
   try {
-    await env.MISSION_RUN_WF.create({ id: run.run_id, params: { run_id: run.run_id, household_id: auth.household_id } });
+    await env.MISSION_RUN_WF.create({ id: instance, params: { run_id: run.run_id, household_id: auth.household_id } });
   } catch (err) {
     if (isAlreadyExists(err)) return json(200, { status: 'already_started', run_id: run.run_id, state: stateOf(run) });
     throw err;
@@ -59,8 +91,8 @@ async function start(env: Env, auth: Auth, run: RunRecord, now: Date): Promise<R
 }
 
 async function decide(env: Env, auth: Auth, run: RunRecord, decision: 'approve' | 'decline', claimedHash: string | null, now: Date): Promise<Response> {
-  if (run.state === 'R1_STAGED' && decision === 'decline') {
-    // Never started: nothing was debited and no Workflow exists. "Not for me" is recorded directly.
+  if ((run.state === 'R1_STAGED' || run.state === 'INSUFFICIENT_CREDITS') && decision === 'decline' && typeof run.params['workflow'] !== 'string') {
+    // Never started, or halted before anything was taken: no Workflow is waiting. "Not for me" is recorded directly.
     const at = now.toISOString();
     await transitionRun(env.DB, auth.household_id, run.run_id, 'DECLINED', at, { declined_reason: 'declined' });
     return json(200, { status: 'declined', run_id: run.run_id });
@@ -79,7 +111,8 @@ async function decide(env: Env, auth: Auth, run: RunRecord, decision: 'approve' 
   )
     .bind(run.run_id, auth.member_id, decision, stored, now.toISOString())
     .run();
-  await env.MISSION_RUN_WF.get(run.run_id).then((instance) =>
+  const wf = workflowOf(env, run);
+  await wf.binding.get(wf.id).then((instance) =>
     instance.sendEvent({ type: `approve:${run.run_id}`, payload: { decision, payload_hash: stored, member_id: auth.member_id } }),
   );
   return json(202, { status: decision === 'approve' ? 'approval_sent' : 'decline_sent', run_id: run.run_id });
@@ -90,7 +123,8 @@ const TERMINAL_OR_LATER = ['R2_APPROVED', 'R3_LINK_ISSUED', 'CONFIRMED', 'EXPIRE
 async function confirm(env: Env, run: RunRecord): Promise<Response> {
   if (run.state === 'CONFIRMED') return json(200, { status: 'already_confirmed', run_id: run.run_id });
   if (run.state !== 'R3_LINK_ISSUED') return error(409, 'no_link_issued', 'There is no issued link to confirm.');
-  await env.MISSION_RUN_WF.get(run.run_id).then((instance) => instance.sendEvent({ type: `confirmed:${run.run_id}`, payload: {} }));
+  const wf = workflowOf(env, run);
+  await wf.binding.get(wf.id).then((instance) => instance.sendEvent({ type: `confirmed:${run.run_id}`, payload: {} }));
   return json(202, { status: 'confirmation_sent', run_id: run.run_id });
 }
 

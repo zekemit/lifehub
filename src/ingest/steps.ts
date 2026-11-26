@@ -21,6 +21,8 @@ export interface StepEvent<T> {
 export interface StepLike {
   do<T>(name: string, callback: () => Promise<T>): Promise<T>;
   do<T>(name: string, config: StepConfigLike, callback: () => Promise<T>): Promise<T>;
+  /** Durably sleeps. `duration` is milliseconds, or text such as '1 day'. */
+  sleep(name: string, duration: number | string): Promise<void>;
   /** Waits for an event sent to this workflow instance; rejects when `timeout` (ms) elapses first. */
   waitForEvent<T>(name: string, options: { type: string; timeout?: number | string }): Promise<StepEvent<T>>;
 }
@@ -80,3 +82,20 @@ export function mergeSummaries(parts: readonly WriteSummary[]): WriteSummary {
   }
   return total;
 }
+
+/**
+ * A StepLike that simply runs each callback now, with no durability. For work done inside a request (an on-demand Life Receipt):
+ * it cannot sleep or wait for events, and says so loudly rather than pretending.
+ */
+export const inlineStep: StepLike = {
+  async do<T>(_name: string, a: StepConfigLike | (() => Promise<T>), b?: () => Promise<T>): Promise<T> {
+    const callback = (typeof a === 'function' ? a : b) as () => Promise<T>;
+    return callback();
+  },
+  async sleep(): Promise<void> {
+    throw new Error('an inline step cannot sleep');
+  },
+  async waitForEvent<T>(): Promise<StepEvent<T>> {
+    throw new Error('an inline step cannot wait for events');
+  },
+};

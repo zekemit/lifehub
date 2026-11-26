@@ -135,6 +135,29 @@ export function buildCopy(triggerKey: string, d: Data): CardCopy {
       };
       break;
     }
+    case 'T_DROP_ALARM': {
+      const venue = str(d['venue']);
+      copy = {
+        title: `${venue} is releasing tables for ${shortDate(str(d['reservation_date']))} at ${str(d['release_clock'])}`,
+        why: `Party of ${num(d['party_size'])}. Tap to open the booking page with the date and party size filled in; you pick the table and finish the booking yourself.`,
+        r2_label: 'Open the booking page',
+        unconfirmed: false,
+        claims: { alarm: `You asked to be alerted when ${venue} releases tables for ${shortDate(str(d['reservation_date']))}` },
+      };
+      break;
+    }
+    case 'T_PRICE_WATCH': {
+      const trip = `${str(d['origin'])} to ${str(d['destination'])}`;
+      const dates = str(d['return_date']) === '' ? shortDate(str(d['depart_date'])) : `${shortDate(str(d['depart_date']))} – ${shortDate(str(d['return_date']))}`;
+      copy = {
+        title: `${trip} fares dropped to ${usd(num(d['fare_cents']))} for ${dates}`,
+        why: `That is under your ${usd(num(d['ceiling_cents']))} ceiling. Tap to open the booking page; you choose the flight and book it yourself.`,
+        r2_label: 'Open the booking page',
+        unconfirmed: false,
+        claims: { watch: `You asked to watch ${trip} (${dates}) for fares under ${usd(num(d['ceiling_cents']))}` },
+      };
+      break;
+    }
     default:
       throw new Error(`no card copy for trigger ${triggerKey}`);
   }

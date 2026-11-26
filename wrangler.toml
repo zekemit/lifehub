@@ -9,7 +9,7 @@ enabled = true
 # Non-secret configuration. Source code reads these from `env`; it never hardcodes the brand or the domain.
 # Secrets (KEK_B64, SESSION_SECRET, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, OPENAI_API_KEY, ANTHROPIC_API_KEY) are set
 # with `wrangler secret put`, never here. Web Push uses VAPID_PRIVATE_KEY (secret) plus VAPID_PUBLIC_KEY and VAPID_SUBJECT;
-# optional AFFILIATE_TAGS is a JSON object keyed by domain. Optional overrides CHIEF_MODEL / WORKER_MODEL (ids from src/llm/pricing.ts) may be
+# optional AFFILIATE_TAGS is a JSON object keyed by domain. Billing and travel use STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET and DUFFEL_API_KEY (all secrets). Optional overrides CHIEF_MODEL / WORKER_MODEL (ids from src/llm/pricing.ts) may be
 # added to [vars]; the defaults are gpt-6.2-sol and gpt-6-luna.
 [vars]
 APP_NAME = "Hayes"
@@ -41,9 +41,28 @@ name = "mission-run"
 binding = "MISSION_RUN_WF"
 class_name = "MissionRunWF"
 
+[[workflows]]
+name = "life-receipt"
+binding = "LIFE_RECEIPT_WF"
+class_name = "LifeReceiptWF"
+
+[[workflows]]
+name = "drop-alarm"
+binding = "DROP_ALARM_WF"
+class_name = "DropAlarmWF"
+
+[[workflows]]
+name = "price-watch"
+binding = "PRICE_WATCH_WF"
+class_name = "PriceWatchWF"
+
 # Hourly. src/workers/scheduled.ts starts the nightly chain only for households whose local time is 03:00.
 [triggers]
 crons = ["0 * * * *"]
+
+# Cloudflare Email Sending, for the weekly Life Receipt. Without it receipts are stored and pushed but not e-mailed.
+[[send_email]]
+name = "RECEIPT_EMAIL"
 
 # Encrypted OAuth tokens. The namespace id is omitted: `wrangler deploy` provisions it.
 [[kv_namespaces]]

@@ -18,7 +18,10 @@ import { evaluateTrigger, loadTriggers, type ClaimRef } from './engine';
 import { buildCopy } from './copy';
 import { buildDeepLink, parseAffiliateTags, resolveDomain, type DeepLink } from './deeplinks';
 import { runGates, type CardPayload, type FactState, type FreshWindow, type GateOutcome, type PlanStep, type ReadContext } from './gates';
-import { debitCredit, refundCredit } from './ledger';
+import { attemptAutoRecharge, type AutoRechargeResult } from '../billing/autoRecharge';
+import { debitCredit, refundCredit } from '../billing/credits';
+import { stripeClient, type StripeClient } from '../billing/stripe';
+import { conciergePayloadParts, readConcierge } from '../concierge/readers';
 import { getRun, recordStep, STEP_NO, transitionRun } from './runState';
 import { CalendarApiError, CalendarAuthError, computeFreeWindows, findCalendarConnector, isoMs, queryBusy } from '../connectors/googleCalendar';
 import { sha256Hex } from '../crypto/vault';
@@ -32,7 +35,7 @@ export type MissionEnv = Pick<
   Env,
   | 'DB' | 'KV' | 'DOCS_BUCKET' | 'KEK_B64' | 'GOOGLE_CLIENT_ID' | 'GOOGLE_CLIENT_SECRET'
   | 'OPENAI_API_KEY' | 'ANTHROPIC_API_KEY' | 'CHIEF_MODEL' | 'WORKER_MODEL'
-  | 'AFFILIATE_TAGS' | 'VAPID_PUBLIC_KEY' | 'VAPID_PRIVATE_KEY' | 'VAPID_SUBJECT'
+  | 'AFFILIATE_TAGS' | 'VAPID_PUBLIC_KEY' | 'VAPID_PRIVATE_KEY' | 'VAPID_SUBJECT' | 'STRIPE_SECRET_KEY' | 'DUFFEL_API_KEY'
 >;
 
 export interface MissionDeps {
@@ -40,6 +43,8 @@ export interface MissionDeps {
   /** MUST be a guarded fetch (createGuardedFetch). */
   fetch: typeof fetch;
   gateway: Gateway;
+  /** Stripe, for off-session auto-recharge. Null when no STRIPE_SECRET_KEY is configured. */
+  stripe: StripeClient | null;
   now: () => Date;
 }
 
@@ -61,6 +66,8 @@ export interface ApprovalEvent {
 
 export type MissionOutcome =
   | { status: 'canceled'; reason: string }
+  /** The balance could not cover the run and auto-recharge could not or may not. Nothing was taken; the card points the member to top up. */
+  | { status: 'insufficient_credits'; auto_recharge: string | null }
   | { status: 'failed_gate'; stage: 'r1' | 'r3'; failed: string[] }
   | { status: 'expired' }
   | { status: 'declined'; reason: 'declined' | 'payload_hash_mismatch' }
@@ -92,6 +99,7 @@ export function missionDepsFromEnv(
     env,
     fetch: guarded,
     gateway: createGateway({ db: env.DB, apiKeys: { openai: env.OPENAI_API_KEY, anthropic: env.ANTHROPIC_API_KEY }, fetch: guarded, now, models: { chief: env.CHIEF_MODEL, worker: env.WORKER_MODEL } }),
+    stripe: env.STRIPE_SECRET_KEY ? stripeClient({ apiKey: env.STRIPE_SECRET_KEY, fetch: guarded }) : null,
     now,
   };
 }
@@ -118,14 +126,19 @@ const CARD_KIND: Readonly<Record<string, CardPayload['kind']>> = {
   anniv_dining: 'dinner_plan',
   subscription_creep: 'cancel_script',
   occasion_plan: 'plan',
+  drop_alarm: 'drop_alarm',
+  flight_watch: 'flight_deal',
 };
 
-interface Compiled {
+export interface Compiled {
   run_id: string;
   household_id: string;
   template_key: string;
   template_version: number;
+  /** Credits this run charges (the template's credits_cost). */
   credits_cost: number;
+  /** 0 for the first Workflow instance of a run; a top-up and a new tap start the next one. */
+  attempt: number;
   max_tier: MissionTier;
   plan: PlanStep[];
   trigger_key: string;
@@ -172,11 +185,11 @@ const iso = (deps: MissionDeps): string => deps.now().toISOString();
 
 // ─── r0_read ────────────────────────────────────────────────────────────────
 
-interface ReadResult {
+export interface ReadResult {
   read: ReadContext;
 }
 
-async function factStates(db: D1Database, household_id: string, claims: readonly ClaimRef[], now: Date): Promise<FactState[]> {
+export async function factStates(db: D1Database, household_id: string, claims: readonly ClaimRef[], now: Date): Promise<FactState[]> {
   const ids = [...new Set(claims.flatMap((c) => c.facts).filter((f): f is string => typeof f === 'string' && f !== ''))];
   const out: FactState[] = [];
   const at = now.toISOString();
@@ -223,6 +236,9 @@ async function freshWindows(deps: MissionDeps, c: Compiled): Promise<ReadContext
 }
 
 export async function readFacts(deps: MissionDeps, c: Compiled): Promise<ReadResult> {
+  // Engine B templates (drop alarms, flight price watches) read their own sources instead of a stored SQL trigger.
+  const concierge = await readConcierge(deps, c);
+  if (concierge !== null) return concierge;
   const db = deps.env.DB;
   const now = deps.now();
   const kind = CARD_KIND[c.template_key];
@@ -357,6 +373,7 @@ export async function buildPayload(db: D1Database, c: Compiled, read: ReadContex
     kind === 'dinner_plan' && Number.isFinite(spanStart)
       ? { start: new Date(spanStart).toISOString(), end: new Date(spanStart + DINNER_SLOT_MS).toISOString() }
       : null;
+  const concierge = conciergePayloadParts(kind, c.timezone, read);
   return {
     version: 1,
     run_id: c.run_id,
@@ -366,10 +383,10 @@ export async function buildPayload(db: D1Database, c: Compiled, read: ReadContex
     kind,
     copy: buildCopy(c.trigger_key, data),
     script: filled.script,
-    price_cents: kind === 'dinner_plan' ? DINNER_ESTIMATE_CENTS : 0,
-    envelope_key: kind === 'dinner_plan' ? read.envelope_key : null,
-    proposed_range: proposed,
-    action: await linkTarget(db, kind, data),
+    price_cents: concierge?.price_cents ?? (kind === 'dinner_plan' ? DINNER_ESTIMATE_CENTS : 0),
+    envelope_key: concierge !== null ? concierge.envelope_key : kind === 'dinner_plan' ? read.envelope_key : null,
+    proposed_range: concierge !== null ? concierge.proposed_range : proposed,
+    action: concierge !== null ? concierge.action : await linkTarget(db, kind, data),
     expires_on: typeof data['expires_on'] === 'string' ? data['expires_on'] : null,
   };
 }
@@ -388,6 +405,7 @@ async function gateRun(deps: MissionDeps, c: Compiled, read: ReadContext, filled
     read,
     payload,
     r3,
+    credit_cost: c.credits_cost,
     fill_failure: filled.fill_failure,
   });
 }
@@ -419,7 +437,8 @@ export async function runMission(step: StepLike, deps: MissionDeps, params: Miss
     const trigger = (await loadTriggers(db)).find((t) => t.trigger_key === trigger_key);
     const hh = await db.prepare('SELECT timezone FROM households WHERE household_id = ?').bind(household_id).first<{ timezone: string }>();
     const at = iso(deps);
-    await transitionRun(db, household_id, run_id, 'COMPILED', at);
+    await transitionRun(db, household_id, run_id, 'COMPILED', at, { failure: null });
+    await db.prepare('UPDATE mission_runs SET credit_cost = ? WHERE run_id = ? AND household_id = ?').bind(tpl.credits_cost, run_id, household_id).run();
     await recordStep(db, run_id, STEP_NO.compile, { kind: 'read', tier: 'R0', status: 'ok', at });
     const claimIds = Array.isArray(run.params['claim_ids']) ? (run.params['claim_ids'] as unknown[]).filter((x): x is string => typeof x === 'string') : [];
     return {
@@ -428,6 +447,7 @@ export async function runMission(step: StepLike, deps: MissionDeps, params: Miss
       template_key: run.template_key,
       template_version: tpl.version,
       credits_cost: tpl.credits_cost,
+      attempt: typeof run.params['attempt'] === 'number' ? run.params['attempt'] : 0,
       max_tier: tpl.max_tier,
       plan: parsePlan(tpl.plan_json),
       trigger_key,
@@ -446,15 +466,34 @@ export async function runMission(step: StepLike, deps: MissionDeps, params: Miss
     return { status: 'canceled', reason: 'template_not_runnable' };
   }
 
-  // debit_credit: fails (CANCELED, nothing refunded because nothing was taken) when the balance is below the cost.
+  // debit_credit: takes the run's credits, subscription credits first. If the balance is short and the household opted in to
+  // auto-recharge (saved card, this month's spend + the pack price within its cap), one off-session top-up is made and the debit retried.
+  // Otherwise the run halts as INSUFFICIENT_CREDITS: nothing was taken, so nothing is refunded, and the card points to /api/credits/checkout.
   const debit = await step.do('debit_credit', async () => {
     const at = iso(deps);
-    const res = await debitCredit(db, household_id, run_id, c.credits_cost, at);
-    await recordStep(db, run_id, STEP_NO.debit_credit, { kind: 'read', tier: 'R0', status: res.ok ? 'ok' : 'failed', gate_name: 'credit_debit', gate_result: { cost: c.credits_cost, balance: res.balance }, at });
-    if (!res.ok) await transitionRun(db, household_id, run_id, 'CANCELED', at, { failure: { stage: 'debit_credit', reason: 'insufficient_credits', balance: res.balance, cost: c.credits_cost } });
-    return res;
+    let res = await debitCredit(db, household_id, run_id, c.credits_cost, at);
+    let recharge: AutoRechargeResult | null = null;
+    if (!res.ok) {
+      recharge = await attemptAutoRecharge({ db, stripe: deps.stripe, now: deps.now }, household_id, run_id, c.attempt);
+      if (recharge.status === 'recharged') res = await debitCredit(db, household_id, run_id, c.credits_cost, at);
+    }
+    const declined = recharge === null || recharge.status === 'recharged' ? null : recharge.reason;
+    await recordStep(db, run_id, STEP_NO.debit_credit, {
+      kind: 'read',
+      tier: 'R0',
+      status: res.ok ? 'ok' : 'failed',
+      gate_name: 'credit_debit',
+      gate_result: { cost: c.credits_cost, balance: res.balance, auto_recharged: recharge?.status === 'recharged', auto_recharge_declined: declined },
+      at,
+    });
+    if (!res.ok) {
+      await transitionRun(db, household_id, run_id, 'INSUFFICIENT_CREDITS', at, {
+        failure: { stage: 'debit_credit', reason: 'INSUFFICIENT_CREDITS', attempt: c.attempt, balance: res.balance, cost: c.credits_cost, auto_recharge: declined, top_up: '/api/credits/checkout' },
+      });
+    }
+    return { ok: res.ok, declined };
   });
-  if (!debit.ok) return { status: 'canceled', reason: 'insufficient_credits' };
+  if (!debit.ok) return { status: 'insufficient_credits', auto_recharge: debit.declined };
 
   const systemError = async (stage: string, err: unknown): Promise<MissionOutcome> => {
     await step.do('system_error', async () => {

@@ -54,7 +54,40 @@ export interface PushCall {
   bodyLength: number;
 }
 
+export interface StripeCall {
+  path: string;
+  headers: Record<string, string>;
+  form: URLSearchParams;
+}
+
+export interface FakeStripeState {
+  calls: StripeCall[];
+  /** Status a created PaymentIntent reports. */
+  intentStatus: string;
+  /** When set, the next payment_intents calls fail with this Stripe error (a declined card, say). */
+  failWith: { status: number; code: string } | null;
+  /** PaymentIntents by idempotency key, so a repeated key returns the same one like Stripe does. */
+  byKey: Map<string, { id: string; status: string }>;
+  count: number;
+}
+
+export interface DuffelOffer {
+  id: string;
+  total_amount: string;
+  total_currency: string;
+  owner: { name: string };
+}
+
+export interface FakeDuffelState {
+  calls: Array<{ method: string; path: string; body: Record<string, unknown> }>;
+  offers: DuffelOffer[];
+  /** Answers every call with this status instead (a 5xx outage, a 4xx rejection). */
+  status: number | null;
+}
+
 export interface Network {
+  stripe: FakeStripeState;
+  duffel: FakeDuffelState;
   google: FakeGoogleState;
   llm: ProviderCall[];
   push: PushCall[];
@@ -74,6 +107,8 @@ export function newNetwork(): Network {
   const googleFetch = fakeGoogle(google);
   const llm: ProviderCall[] = [];
   const net: Network = {
+    stripe: { calls: [], intentStatus: 'succeeded', failWith: null, byKey: new Map(), count: 0 },
+    duffel: { calls: [], offers: [], status: null },
     google,
     llm,
     push: [],
@@ -90,6 +125,8 @@ export function newNetwork(): Network {
     const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
     net.hosts.push(url.hostname);
     if (url.hostname === 'api.openai.com' || url.hostname === 'api.anthropic.com') return provider.fetch(input, init);
+    if (url.hostname === 'api.stripe.com') return fakeStripeResponse(net.stripe, url, init);
+    if (url.hostname === 'api.duffel.com') return fakeDuffelResponse(net.duffel, url, init);
     if (url.hostname === PUSH_HOST) {
       const h = new Headers(init?.headers);
       net.push.push({ url: url.href, authorization: h.get('authorization'), ttl: h.get('ttl'), bodyLength: typeof init?.body === 'string' ? init.body.length : init?.body ? 1 : 0 });
@@ -99,6 +136,37 @@ export function newNetwork(): Network {
     return new Response('unexpected host', { status: 500 });
   }) as typeof fetch;
   return net;
+}
+
+const jsonRes = (status: number, body: unknown): Response => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+
+function fakeStripeResponse(state: FakeStripeState, url: URL, init?: RequestInit): Response {
+  const headers: Record<string, string> = {};
+  new Headers(init?.headers).forEach((v, k) => { headers[k] = v; });
+  const form = new URLSearchParams(typeof init?.body === 'string' ? init.body : '');
+  state.calls.push({ path: url.pathname, headers, form });
+  if (url.pathname === '/v1/checkout/sessions') {
+    state.count += 1;
+    return jsonRes(200, { id: `cs_test_${state.count}`, url: `https://checkout.stripe.com/c/pay/cs_test_${state.count}` });
+  }
+  if (url.pathname === '/v1/payment_intents') {
+    if (state.failWith !== null) return jsonRes(state.failWith.status, { error: { code: state.failWith.code, message: 'Your card was declined.' } });
+    const key = headers['idempotency-key'] ?? '';
+    const prior = state.byKey.get(key);
+    if (prior !== undefined) return jsonRes(200, prior);
+    // Stripe's ids are globally unique, and the ledger keys grants on them, so the fake's must be too
+    const pi = { id: `pi_test_${randomUUID().replace(/-/g, '').slice(0, 16)}`, status: state.intentStatus };
+    state.byKey.set(key, pi);
+    return jsonRes(200, pi);
+  }
+  return jsonRes(404, { error: { message: 'unexpected Stripe path' } });
+}
+
+function fakeDuffelResponse(state: FakeDuffelState, url: URL, init?: RequestInit): Response {
+  state.calls.push({ method: init?.method ?? 'GET', path: url.pathname + url.search, body: JSON.parse(typeof init?.body === 'string' ? init.body : '{}') as Record<string, unknown> });
+  if (state.status !== null) return jsonRes(state.status, { errors: [{ message: 'upstream' }] });
+  if (url.pathname === '/air/offer_requests') return jsonRes(200, { data: { offers: state.offers } });
+  return jsonRes(404, { errors: [{ message: 'unexpected Duffel path' }] });
 }
 
 export interface Scenario {
@@ -169,11 +237,11 @@ export function fixtures(rt: TestRuntime) {
     return { h, cardId: card.entity_id, episode };
   }
 
-  /** +n credits (admin_adjust). Households start with none: grants come from Stripe events in a later milestone. */
+  /** +n subscription credits (admin_adjust). makeHousehold households start with none; only the Google sign-in path grants the trial credits. */
   async function grant(h: Household, n: number): Promise<void> {
     await db
-      .prepare(`INSERT INTO credit_ledger (entry_id, household_id, delta, reason, run_id, stripe_event_id) VALUES (?, ?, ?, 'admin_adjust', NULL, NULL)`)
-      .bind(`led_grant_${randomUUID()}`, h.household_id, n)
+      .prepare(`INSERT INTO credit_ledger (entry_id, household_id, delta, sub_delta, pur_delta, reason, run_id, stripe_event_id) VALUES (?, ?, ?, ?, 0, 'admin_adjust', NULL, NULL)`)
+      .bind(`led_grant_${randomUUID()}`, h.household_id, n, n)
       .run();
   }
 

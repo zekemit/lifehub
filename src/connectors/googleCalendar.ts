@@ -544,11 +544,16 @@ export function computeFreeWindows(busy: readonly BusyBlock[], timeZone: string,
 /** Busy blocks of the primary calendar for the next `horizonDays` (freeBusy.query, scope calendar.freebusy). */
 export async function queryBusy(deps: CalendarDeps, connector: ConnectorRecord, timeZone: string, horizonDays: number): Promise<BusyBlock[]> {
   const now = deps.now();
+  return queryBusyRange(deps, connector, timeZone, now.toISOString(), new Date(now.getTime() + horizonDays * DAY_MS).toISOString());
+}
+
+/** Busy blocks of the primary calendar between two instants (freeBusy.query, scope calendar.freebusy). */
+export async function queryBusyRange(deps: CalendarDeps, connector: ConnectorRecord, timeZone: string, timeMin: string, timeMax: string): Promise<BusyBlock[]> {
   const body = (await googleGet(deps, connector, new URL(FREEBUSY_URL), {
     method: 'POST',
     body: JSON.stringify({
-      timeMin: now.toISOString(),
-      timeMax: new Date(now.getTime() + horizonDays * DAY_MS).toISOString(),
+      timeMin,
+      timeMax,
       timeZone,
       items: [{ id: 'primary' }],
     }),
