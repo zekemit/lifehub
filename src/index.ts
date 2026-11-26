@@ -10,6 +10,7 @@ import type { Env } from './types';
 export { CalendarSyncWF } from './workflows/calendarSyncWF';
 export { IngestEmailWF } from './workflows/ingestEmailWF';
 export { IngestFileWF } from './workflows/ingestFileWF';
+export { MissionRunWF } from './workflows/missionRunWF';
 export { NightlySweepWF } from './workflows/nightlySweepWF';
 
 export default {

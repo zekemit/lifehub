@@ -7,6 +7,10 @@
  */
 
 import { ACTIVE_STATES, HOME_CAPACITY, loadVerifiedEvidence, type Evidence } from './engine';
+import type { MissionState } from '../types';
+
+/** States a card can be shown in: staged, in flight in MissionRunWF, awaiting the member, or holding an issued link. */
+const HOME_STATES = ['COMPILED', 'R0_READ', 'GATED', 'R1_STAGED', 'R2_AWAITING', 'R2_APPROVED', 'R3_LINK_ISSUED'] as const;
 
 export interface EvidenceChip {
   claim_id: string;
@@ -20,8 +24,22 @@ export interface EvidenceChip {
   char_end: number;
 }
 
+export interface HomeLink {
+  url: string;
+  merchant_domain: string;
+  affiliate_program: string | null;
+  issued_at: string;
+}
+
 export interface HomeCard {
   run_id: string;
+  state: MissionState;
+  /** Hash of the exact card the member approves; send it back with the approval. Null until MissionRunWF has staged the card. */
+  payload_hash: string | null;
+  /** Model-written call script (retention / cancel), shown on the card; null for cards without one. */
+  script: string | null;
+  /** The issued deep link, once MissionRunWF has reached R3. */
+  link: HomeLink | null;
   trigger_key: string;
   title: string;
   why: string;
@@ -52,6 +70,7 @@ const WEEK_MS = 7 * 86_400_000;
 
 interface RunRow {
   run_id: string;
+  state: MissionState;
   params_json: string;
   expires_at: string | null;
 }
@@ -82,9 +101,10 @@ export async function getHome(db: D1Database, household_id: string, now: Date): 
 
   const { results: runs } = await db
     .prepare(
-      `SELECT run_id, params_json, expires_at FROM mission_runs
-        WHERE household_id = ? AND state IN ('R1_STAGED', 'R2_AWAITING') AND (expires_at IS NULL OR expires_at >= ?)
-        ORDER BY json_extract(params_json, '$.score') DESC, created_at DESC, run_id
+      `SELECT run_id, state, params_json, expires_at FROM mission_runs
+        WHERE household_id = ? AND state IN (${HOME_STATES.map((s) => `'${s}'`).join(', ')}) AND (expires_at IS NULL OR expires_at >= ?)
+        ORDER BY CASE state WHEN 'R3_LINK_ISSUED' THEN 0 WHEN 'R2_APPROVED' THEN 1 ELSE 2 END,
+                 json_extract(params_json, '$.score') DESC, created_at DESC, run_id
         LIMIT ?`,
     )
     .bind(household_id, iso, HOME_CAPACITY)
@@ -124,8 +144,17 @@ export async function getHome(db: D1Database, household_id: string, now: Date): 
         });
       }
     }
+    const link = p['link'] as Partial<HomeLink> | null | undefined;
+    const payload = p['payload'] as { script?: unknown } | null | undefined;
     cards.push({
       run_id: run.run_id,
+      state: run.state,
+      payload_hash: typeof p['payload_hash'] === 'string' ? p['payload_hash'] : null,
+      script: typeof payload?.script === 'string' ? payload.script : null,
+      link:
+        link !== null && link !== undefined && typeof link.url === 'string'
+          ? { url: link.url, merchant_domain: String(link.merchant_domain ?? ''), affiliate_program: typeof link.affiliate_program === 'string' ? link.affiliate_program : null, issued_at: String(link.issued_at ?? '') }
+          : null,
       trigger_key: String(p['trigger_key'] ?? ''),
       title: String(p['title'] ?? ''),
       why: String(p['why'] ?? ''),

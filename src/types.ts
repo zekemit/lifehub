@@ -37,6 +37,7 @@ export interface Env {
   INGEST_FILE_WF: Workflow<IngestFileParams>;
   CALENDAR_SYNC_WF: Workflow<CalendarSyncParams>;
   NIGHTLY_SWEEP_WF: Workflow<NightlySweepParams>;
+  MISSION_RUN_WF: Workflow<MissionRunParams>;
   /** Encrypted OAuth tokens (wrangler.toml [[kv_namespaces]]). Values are AES-GCM under the household DEK. */
   KV: KVNamespace;
   /** Secrets (`wrangler secret put`): 32-byte base64 key-encryption key, and the two LLM provider keys. */
@@ -50,6 +51,21 @@ export interface Env {
   /** Optional model overrides; must be ids listed in src/llm/pricing.ts. Defaults: gpt-6.2-sol (chief), gpt-6-luna (worker). */
   CHIEF_MODEL?: string;
   WORKER_MODEL?: string;
+  /**
+   * Optional affiliate programs, a JSON object keyed by merchant domain:
+   * {"shop.example": {"program": "name", "param": "ref", "value": "tag"}}. Domains in policy_blocklist are never tagged.
+   */
+  AFFILIATE_TAGS?: string;
+  /** Web Push (VAPID). Public key (base64url, 65-byte point) and subject (mailto: or https: URL) are vars; the private key is a secret. */
+  VAPID_PUBLIC_KEY?: string;
+  VAPID_PRIVATE_KEY?: string;
+  VAPID_SUBJECT?: string;
+}
+
+/** Payload of a MissionRunWF instance. Everything else is read from the mission_runs row. */
+export interface MissionRunParams {
+  run_id: string;
+  household_id: string;
 }
 
 /** Payload of an IngestEmailWF instance. The raw MIME is already encrypted in R2 at `r2_key`. */
@@ -752,9 +768,11 @@ export const MISSION_STATE_TRANSITIONS: Readonly<Record<MissionState, readonly M
   COMPILED: ['R0_READ', 'CANCELED'],
   R0_READ: ['GATED', 'FAILED_GATE', 'CANCELED'],
   GATED: ['R1_STAGED', 'CANCELED'],
-  R1_STAGED: ['R2_AWAITING', 'CANCELED'],
+  // 'COMPILED': the member tapped the staged card, so MissionRunWF takes it over. 'DECLINED': "Not for me" on a staged card.
+  R1_STAGED: ['R2_AWAITING', 'COMPILED', 'DECLINED', 'CANCELED'],
   R2_AWAITING: ['R2_APPROVED', 'DECLINED', 'EXPIRED', 'CANCELED'],
-  R2_APPROVED: ['R3_LINK_ISSUED', 'FAILED_GATE', 'CANCELED'],
+  // 'CONFIRMED' straight from R2_APPROVED is for templates whose max tier is R2 (a script the member carries out themselves).
+  R2_APPROVED: ['R3_LINK_ISSUED', 'CONFIRMED', 'FAILED_GATE', 'CANCELED'],
   R3_LINK_ISSUED: ['CONFIRMED'],
   CONFIRMED: [],
   EXPIRED: [],

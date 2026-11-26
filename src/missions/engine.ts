@@ -266,9 +266,12 @@ export async function expireStaleRuns(db: D1Database, household_id: string, now:
   return res.meta.changes ?? 0;
 }
 
+/** Cards that hold one of the household's HOME_CAPACITY slots: staged, in flight in MissionRunWF, or approved and awaiting their link. */
+export const CAPACITY_STATES = ['COMPILED', 'R0_READ', 'GATED', 'R1_STAGED', 'R2_AWAITING', 'R2_APPROVED'] as const;
+
 export async function activeStagedCount(db: D1Database, household_id: string): Promise<number> {
   const row = await db
-    .prepare(`SELECT COUNT(*) AS n FROM mission_runs WHERE household_id = ? AND state IN (${STAGED_STATES.map((s) => `'${s}'`).join(', ')})`)
+    .prepare(`SELECT COUNT(*) AS n FROM mission_runs WHERE household_id = ? AND state IN (${CAPACITY_STATES.map((s) => `'${s}'`).join(', ')})`)
     .bind(household_id)
     .first<{ n: number }>();
   return row?.n ?? 0;

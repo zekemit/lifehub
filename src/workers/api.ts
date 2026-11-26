@@ -6,51 +6,26 @@
  *                             a binary PDF is refused with 415 because text extraction happens in the app before upload.
  *                             Stored encrypted in R2, then IngestFileWF is started.
  *   POST /api/calendar/sync   starts CalendarSyncWF (which ends by starting NightlySweepWF). 409 if no calendar is connected.
- *   GET  /api/home            header metrics + top 3 staged Mission Cards with verbatim evidence quotes.
+ *   GET  /api/home            header metrics + the household's open Mission Cards with verbatim evidence quotes.
+ *   GET  /api/auth/google/login, /api/auth/google/callback   public: Google sign-in (src/workers/auth.ts).
+ *   GET  /api/auth/me, POST /api/auth/logout
+ *   POST /api/missions/<run_id>/(start|approve|decline|confirm), POST /api/push/subscribe   (src/workers/missions.ts)
  *
- * Authentication: `Authorization: Bearer <session token>` (src/workers/session.ts), and the member must still belong to the
- * household in the token. The household id is NEVER taken from the request body, query or path.
+ * Authentication (every route except the two sign-in routes): the sealed __Host-session cookie set by the Google callback, or
+ * `Authorization: Bearer <session token>` (src/workers/session.ts); the member must still belong to a live household. Cookie-authenticated
+ * unsafe requests need a same-origin Origin header. The household id is NEVER taken from the request body, query or path.
  */
 
 import { objectExists, putEncrypted, sha256Hex } from '../crypto/vault';
 import { findCalendarConnector } from '../connectors/googleCalendar';
 import { getHome } from '../missions/home';
+import { createGuardedFetch } from '../net/egress';
 import type { Env, IngestFileParams, SignConvention } from '../types';
-import { verifySessionToken } from './session';
+import { authenticate, handleGoogleCallback, handleGoogleLogin, handleLogout, handleMe, passesCsrf, type Auth } from './auth';
+import { error, isAlreadyExists, json } from './http';
+import { handleMission, handlePushSubscribe, parseMissionPath } from './missions';
 
 export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
-
-const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
-
-function json(status: number, body: unknown, extra: Record<string, string> = {}): Response {
-  return new Response(JSON.stringify(body), { status, headers: { ...JSON_HEADERS, ...extra } });
-}
-
-const error = (status: number, code: string, message: string): Response => json(status, { error: code, message });
-
-function isAlreadyExists(err: unknown): boolean {
-  return /already|exist/i.test(err instanceof Error ? err.message : String(err));
-}
-
-interface Auth {
-  household_id: string;
-  member_id: string;
-}
-
-async function authenticate(request: Request, env: Env, now: Date): Promise<Auth | null> {
-  const header = request.headers.get('authorization') ?? '';
-  const match = /^Bearer\s+(\S+)$/i.exec(header);
-  if (match === null) return null;
-  const claims = await verifySessionToken(env.SESSION_SECRET, match[1]!, now);
-  if (claims === null) return null;
-  const row = await env.DB.prepare(
-    `SELECT 1 AS ok FROM members m JOIN households h ON h.household_id = m.household_id
-      WHERE m.member_id = ? AND m.household_id = ? AND h.deleted_at IS NULL`,
-  )
-    .bind(claims.member_id, claims.household_id)
-    .first<{ ok: number }>();
-  return row === null ? null : claims;
-}
 
 const SIGN_CONVENTIONS: readonly SignConvention[] = ['auto', 'negative_is_outflow', 'positive_is_outflow'];
 
@@ -135,22 +110,50 @@ async function calendarSync(env: Env, auth: Auth, now: Date): Promise<Response> 
   return json(202, { status: 'accepted', instance_id });
 }
 
-export async function handleApi(request: Request, env: Env, deps: { now?: () => Date } = {}): Promise<Response> {
-  const now = (deps.now ?? (() => new Date()))();
+const ROUTES: Readonly<Record<string, string>> = {
+  '/api/ingest/file': 'POST',
+  '/api/calendar/sync': 'POST',
+  '/api/home': 'GET',
+  '/api/auth/me': 'GET',
+  '/api/auth/logout': 'POST',
+  '/api/push/subscribe': 'POST',
+};
+const PUBLIC_ROUTES: Readonly<Record<string, string>> = { '/api/auth/google/login': 'GET', '/api/auth/google/callback': 'GET' };
+
+/** `deps.fetch` is the network used for Google's token endpoint; production gets the policy-guarded fetch. */
+export async function handleApi(request: Request, env: Env, deps: { now?: () => Date; fetch?: typeof fetch } = {}): Promise<Response> {
+  const nowFn = deps.now ?? (() => new Date());
+  const now = nowFn();
   const path = new URL(request.url).pathname;
-  const routes: Record<string, string> = { '/api/ingest/file': 'POST', '/api/calendar/sync': 'POST', '/api/home': 'GET' };
-  const method = routes[path];
+
+  const publicMethod = PUBLIC_ROUTES[path];
+  if (publicMethod !== undefined) {
+    if (request.method !== publicMethod) return json(405, { error: 'method_not_allowed', message: `Use ${publicMethod}.` }, { allow: publicMethod });
+    const authDeps = { now: nowFn, fetch: deps.fetch ?? createGuardedFetch({ db: env.DB }) };
+    return path === '/api/auth/google/login' ? handleGoogleLogin(request, env, authDeps) : handleGoogleCallback(request, env, authDeps);
+  }
+
+  const mission = parseMissionPath(path);
+  const method = mission !== null ? 'POST' : ROUTES[path];
   if (method === undefined) return error(404, 'not_found', 'No such endpoint.');
   if (request.method !== method) return json(405, { error: 'method_not_allowed', message: `Use ${method}.` }, { allow: method });
 
   const auth = await authenticate(request, env, now);
   if (auth === null) return error(401, 'unauthorized', 'Sign in again.');
+  if (!passesCsrf(request, auth)) return error(403, 'csrf', 'Cross-site request refused.');
 
+  if (mission !== null) return handleMission(request, env, auth, mission, now);
   switch (path) {
     case '/api/ingest/file':
       return ingestFile(request, env, auth);
     case '/api/calendar/sync':
       return calendarSync(env, auth, now);
+    case '/api/auth/me':
+      return handleMe(env, auth);
+    case '/api/auth/logout':
+      return handleLogout();
+    case '/api/push/subscribe':
+      return handlePushSubscribe(request, env, auth);
     default:
       return json(200, await getHome(env.DB, auth.household_id, now));
   }
