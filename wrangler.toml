@@ -8,7 +8,8 @@ enabled = true
 
 # Non-secret configuration. Source code reads these from `env`; it never hardcodes the brand or the domain.
 # Secrets (KEK_B64, SESSION_SECRET, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, OPENAI_API_KEY, ANTHROPIC_API_KEY) are set
-# with `wrangler secret put`, never here. Optional overrides CHIEF_MODEL / WORKER_MODEL (ids from src/llm/pricing.ts) may be
+# with `wrangler secret put`, never here. Web Push uses VAPID_PRIVATE_KEY (secret) plus VAPID_PUBLIC_KEY and VAPID_SUBJECT;
+# optional AFFILIATE_TAGS is a JSON object keyed by domain. Optional overrides CHIEF_MODEL / WORKER_MODEL (ids from src/llm/pricing.ts) may be
 # added to [vars]; the defaults are gpt-6.2-sol and gpt-6-luna.
 [vars]
 APP_NAME = "Hayes"
@@ -34,6 +35,11 @@ class_name = "CalendarSyncWF"
 name = "nightly-sweep"
 binding = "NIGHTLY_SWEEP_WF"
 class_name = "NightlySweepWF"
+
+[[workflows]]
+name = "mission-run"
+binding = "MISSION_RUN_WF"
+class_name = "MissionRunWF"
 
 # Hourly. src/workers/scheduled.ts starts the nightly chain only for households whose local time is 03:00.
 [triggers]

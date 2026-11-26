@@ -5,8 +5,8 @@
 
 import { randomUUID } from 'node:crypto';
 import type { InboundMessage } from '../../src/workers/emailRouter';
-import type { StepConfigLike, StepLike } from '../../src/ingest/steps';
-import type { CalendarSyncParams, Env, IngestEmailParams, IngestFileParams, NightlySweepParams } from '../../src/types';
+import type { StepConfigLike, StepEvent, StepLike } from '../../src/ingest/steps';
+import type { CalendarSyncParams, Env, IngestEmailParams, IngestFileParams, MissionRunParams, NightlySweepParams } from '../../src/types';
 import type { QueryCounter } from './index';
 
 // ── Workflow step (direct execution + accounting) ──
@@ -16,8 +16,19 @@ export interface StepLogEntry {
   queries: number;
 }
 
-export function directStep(counter?: QueryCounter): { step: StepLike; log: StepLogEntry[] } {
+/** What `waitForEvent` yields for an event type: a payload (or a function producing one, so it can read the DB), or TIMEOUT. */
+export const TIMEOUT = Symbol('waitForEvent timeout');
+export type EventScript = unknown | (() => unknown | Promise<unknown>);
+
+export interface WaitLogEntry {
+  name: string;
+  type: string;
+  timeout: number | string | undefined;
+}
+
+export function directStep(counter?: QueryCounter, events: Record<string, EventScript> = {}): { step: StepLike; log: StepLogEntry[]; waits: WaitLogEntry[] } {
   const log: StepLogEntry[] = [];
+  const waits: WaitLogEntry[] = [];
   const step: StepLike = {
     async do<T>(name: string, a: StepConfigLike | (() => Promise<T>), b?: () => Promise<T>): Promise<T> {
       const callback = (typeof a === 'function' ? a : b) as () => Promise<T>;
@@ -26,8 +37,16 @@ export function directStep(counter?: QueryCounter): { step: StepLike; log: StepL
       log.push({ name, queries: (counter?.count ?? 0) - before });
       return result;
     },
+    async waitForEvent<T>(name: string, options: { type: string; timeout?: number | string }): Promise<StepEvent<T>> {
+      waits.push({ name, type: options.type, timeout: options.timeout });
+      const script = events[options.type];
+      if (script === undefined || script === TIMEOUT) throw new Error(`waitForEvent '${name}' timed out`);
+      const payload = typeof script === 'function' ? await (script as () => unknown)() : script;
+      if (payload === TIMEOUT) throw new Error(`waitForEvent '${name}' timed out`);
+      return { type: options.type, payload: payload as T };
+    },
   };
-  return { step, log };
+  return { step, log, waits };
 }
 
 // ── fake LLM providers (network only) ──
@@ -106,6 +125,9 @@ export interface FakeWorkflows {
   file: Array<{ id: string; params: IngestFileParams }>;
   calendar: Array<{ id: string; params: CalendarSyncParams }>;
   sweep: Array<{ id: string; params: NightlySweepParams }>;
+  mission: Array<{ id: string; params: MissionRunParams }>;
+  /** Events sent to MissionRunWF instances: sendEvent({type, payload}). */
+  events: Array<{ id: string; type: string; payload: unknown }>;
 }
 
 /** 32 random bytes, base64. */
@@ -120,8 +142,8 @@ const PROCESS_KEK = randomKek();
  * An Env for tests. APP_NAME and INBOUND_DOMAIN deliberately differ from wrangler.toml, so any code that hardcoded
  * the real brand or domain would visibly misbehave.
  */
-export function testEnv(rt: { db: D1Database; bucket: R2Bucket; kv?: KVNamespace }): { env: Env; workflows: FakeWorkflows } {
-  const workflows: FakeWorkflows = { email: [], file: [], calendar: [], sweep: [] };
+export function testEnv(rt: { db: D1Database; bucket: R2Bucket; kv?: KVNamespace }, extra: Partial<Env> = {}): { env: Env; workflows: FakeWorkflows } {
+  const workflows: FakeWorkflows = { email: [], file: [], calendar: [], sweep: [], mission: [], events: [] };
   const recorder = <P>(list: Array<{ id: string; params: P }>) => ({
     create: async (o: { id: string; params: P }) => {
       if (list.some((w) => w.id === o.id)) throw new Error('instance already exists');
@@ -141,10 +163,20 @@ export function testEnv(rt: { db: D1Database; bucket: R2Bucket; kv?: KVNamespace
     INGEST_FILE_WF: recorder(workflows.file),
     CALENDAR_SYNC_WF: recorder(workflows.calendar),
     NIGHTLY_SWEEP_WF: recorder(workflows.sweep),
+    MISSION_RUN_WF: {
+      ...recorder(workflows.mission),
+      get: async (id: string) => ({
+        id,
+        sendEvent: async (e: { type: string; payload: unknown }) => {
+          workflows.events.push({ id, type: e.type, payload: e.payload });
+        },
+      }),
+    },
     KV: rt.kv,
     GOOGLE_CLIENT_ID: 'client-id.apps.test',
     GOOGLE_CLIENT_SECRET: 'client-secret',
     SESSION_SECRET: 'test-session-secret-0123456789',
+    ...extra,
   } as unknown as Env;
   return { env, workflows };
 }

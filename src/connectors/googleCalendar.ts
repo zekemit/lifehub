@@ -158,38 +158,83 @@ function emailFromIdToken(idToken: string | undefined): string | null {
   }
 }
 
-/** Exchanges an authorization code and activates the household's calendar connector. */
-export async function exchangeCode(
-  deps: CalendarDeps,
-  household_id: string,
-  code: string,
-  redirectUri: string,
-): Promise<{ connector_id: string; email: string | null }> {
+export class IdentityError extends Error {
+  override readonly name = 'IdentityError';
+}
+
+export interface GoogleIdentity {
+  /** Google's stable account id. */
+  sub: string;
+  /** Lower-cased, verified by Google. */
+  email: string;
+  name: string | null;
+}
+
+/**
+ * Reads the OpenID identity from the id_token Google returned from the token endpoint. The token arrived over TLS straight from
+ * Google in exchange for our own code (+ PKCE verifier), so OIDC Core 3.1.3.7 lets us skip signature verification; we still check
+ * who issued it, that it was minted for THIS client, that it has not expired, and that Google verified the e-mail address.
+ */
+export function parseIdToken(idToken: string | undefined, o: { clientId: string; nowMs: number }): GoogleIdentity {
+  if (idToken === undefined) throw new IdentityError('Google did not return an id_token');
+  let claims: Record<string, unknown>;
+  try {
+    const payload = idToken.split('.')[1] ?? '';
+    claims = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(payload.replace(/-/g, '+').replace(/_/g, '/')), (ch) => ch.charCodeAt(0)))) as Record<string, unknown>;
+  } catch {
+    throw new IdentityError('the id_token is malformed');
+  }
+  if (claims['iss'] !== 'https://accounts.google.com' && claims['iss'] !== 'accounts.google.com') throw new IdentityError('the id_token was not issued by Google');
+  const aud = claims['aud'];
+  if (!(aud === o.clientId || (Array.isArray(aud) && aud.includes(o.clientId)))) throw new IdentityError('the id_token was issued for a different client');
+  if (typeof claims['exp'] !== 'number' || claims['exp'] * 1000 <= o.nowMs) throw new IdentityError('the id_token has expired');
+  if (typeof claims['sub'] !== 'string' || claims['sub'] === '') throw new IdentityError('the id_token has no subject');
+  if (typeof claims['email'] !== 'string' || claims['email'] === '') throw new IdentityError('the id_token has no e-mail address');
+  if (claims['email_verified'] !== true) throw new IdentityError('Google has not verified this e-mail address');
+  return { sub: claims['sub'], email: claims['email'].toLowerCase(), name: typeof claims['name'] === 'string' ? claims['name'].slice(0, 120) : null };
+}
+
+export interface GoogleGrant {
+  access_token: string;
+  refresh_token: string | undefined;
+  expires_in: number;
+  scope: string;
+  id_token: string | undefined;
+}
+
+/** Exchanges an authorization code (and PKCE verifier) for tokens. Rejects any scope outside GOOGLE_SCOPES. Stores nothing. */
+export async function requestTokens(deps: CalendarDeps, code: string, redirectUri: string, codeVerifier?: string): Promise<GoogleGrant> {
   const { status, body } = await postToken(deps, {
     code,
     client_id: deps.env.GOOGLE_CLIENT_ID,
     client_secret: deps.env.GOOGLE_CLIENT_SECRET,
     redirect_uri: redirectUri,
     grant_type: 'authorization_code',
+    ...(codeVerifier === undefined ? {} : { code_verifier: codeVerifier }),
   });
   if (status !== 200 || !body.access_token) {
     throw new CalendarAuthError(`token exchange failed: ${body.error ?? status}`);
   }
   assertAllowedScopes(body.scope ?? '');
+  return { access_token: body.access_token, refresh_token: body.refresh_token, expires_in: body.expires_in ?? 3600, scope: body.scope ?? '', id_token: body.id_token };
+}
+
+/** Encrypts the grant's tokens into KV and activates the household's calendar connector. */
+export async function storeConnector(deps: CalendarDeps, household_id: string, grant: GoogleGrant): Promise<{ connector_id: string }> {
   const existing = await deps.env.DB.prepare(`SELECT connector_id, token_kv_key FROM connectors WHERE household_id = ? AND kind = 'google_calendar'`)
     .bind(household_id)
     .first<{ connector_id: string; token_kv_key: string | null }>();
   const connector_id = existing?.connector_id ?? `con_${crypto.randomUUID().replace(/-/g, '')}`;
   const key = kvKeyFor(connector_id);
   // A refresh token is only issued on first consent; keep the old one if Google does not send a new one.
-  let refresh = body.refresh_token;
+  let refresh = grant.refresh_token;
   if (refresh === undefined && existing?.token_kv_key) refresh = (await loadTokens(deps, household_id, existing.token_kv_key).catch(() => null))?.refresh_token;
   if (refresh === undefined) throw new CalendarAuthError('Google did not return a refresh token; reconnect with consent');
   await saveTokens(deps, household_id, key, {
-    access_token: body.access_token,
+    access_token: grant.access_token,
     refresh_token: refresh,
-    expires_at: deps.now().getTime() + (body.expires_in ?? 3600) * 1000,
-    scope: body.scope ?? '',
+    expires_at: deps.now().getTime() + grant.expires_in * 1000,
+    scope: grant.scope,
   });
   await deps.env.DB.prepare(
     `INSERT INTO connectors (connector_id, household_id, kind, status, scopes, token_kv_key, sync_cursor, last_error)
@@ -197,9 +242,22 @@ export async function exchangeCode(
      ON CONFLICT (connector_id) DO UPDATE SET status = 'active', scopes = excluded.scopes, token_kv_key = excluded.token_kv_key,
                                               sync_cursor = NULL, last_error = NULL`,
   )
-    .bind(connector_id, household_id, body.scope ?? '', key)
+    .bind(connector_id, household_id, grant.scope, key)
     .run();
-  return { connector_id, email: emailFromIdToken(body.id_token) };
+  return { connector_id };
+}
+
+/** Exchanges an authorization code and activates the household's calendar connector. */
+export async function exchangeCode(
+  deps: CalendarDeps,
+  household_id: string,
+  code: string,
+  redirectUri: string,
+  codeVerifier?: string,
+): Promise<{ connector_id: string; email: string | null }> {
+  const grant = await requestTokens(deps, code, redirectUri, codeVerifier);
+  const { connector_id } = await storeConnector(deps, household_id, grant);
+  return { connector_id, email: emailFromIdToken(grant.id_token) };
 }
 
 export async function findCalendarConnector(db: D1Database, household_id: string): Promise<ConnectorRecord | null> {

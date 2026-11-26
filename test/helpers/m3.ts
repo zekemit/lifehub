@@ -38,6 +38,12 @@ export interface FakeGoogleState {
   syncCounter: number;
   /** Refresh-token grants answer invalid_grant (the member revoked access). */
   revokeRefresh: boolean;
+  /** Who Google says signed in (Milestone 4 sign-in). */
+  identity: { email: string; sub: string; name: string | null; email_verified: boolean };
+  /** Merged over the id_token claims (iss, aud, exp ...). */
+  idClaims: Record<string, unknown>;
+  /** The first code exchange returns no refresh_token (the member had already consented before). */
+  omitRefreshToken: boolean;
   log: GoogleLogEntry[];
 }
 
@@ -45,14 +51,24 @@ export const GOOD_SCOPE =
   'openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/calendar.events.readonly https://www.googleapis.com/auth/calendar.freebusy';
 
 export function newGoogle(): FakeGoogleState {
-  return { events: [], delta: [], busy: [], scope: 'openid email https://www.googleapis.com/auth/calendar.events.readonly https://www.googleapis.com/auth/calendar.freebusy', expireSyncToken: false, pageSize: 2500, refreshCount: 0, rejectNextAccessToken: false, syncCounter: 0, revokeRefresh: false, log: [] };
+  return { events: [], delta: [], busy: [], scope: 'openid email https://www.googleapis.com/auth/calendar.events.readonly https://www.googleapis.com/auth/calendar.freebusy', expireSyncToken: false, pageSize: 2500, refreshCount: 0, rejectNextAccessToken: false, syncCounter: 0, revokeRefresh: false, identity: { email: 'member@example.org', sub: 'google-sub-1', name: 'Test Member', email_verified: true }, idClaims: {}, omitRefreshToken: false, log: [] };
 }
 
 const jsonRes = (status: number, body: unknown): Response => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 
-function idToken(email: string): string {
-  const b64 = (o: unknown): string => btoa(JSON.stringify(o)).replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
-  return `${b64({ alg: 'none' })}.${b64({ email, email_verified: true })}.sig`;
+function idToken(state: FakeGoogleState, clientId: string): string {
+  const b64 = (o: unknown): string => btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(o)))).replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const claims = {
+    iss: 'https://accounts.google.com',
+    aud: clientId,
+    sub: state.identity.sub,
+    exp: Math.floor(Date.now() / 1000) + 3600,
+    email: state.identity.email,
+    email_verified: state.identity.email_verified,
+    ...(state.identity.name === null ? {} : { name: state.identity.name }),
+    ...state.idClaims,
+  };
+  return `${b64({ alg: 'none' })}.${b64(claims)}.sig`;
 }
 
 export function fakeGoogle(state: FakeGoogleState): typeof fetch {
@@ -67,7 +83,7 @@ export function fakeGoogle(state: FakeGoogleState): typeof fetch {
       const form = new URLSearchParams(body);
       if (form.get('grant_type') === 'authorization_code') {
         if (form.get('code') !== 'good-code') return jsonRes(400, { error: 'invalid_grant' });
-        return jsonRes(200, { access_token: 'at-initial', refresh_token: 'rt-secret', expires_in: 3600, scope: state.scope, id_token: idToken('member@example.org') });
+        return jsonRes(200, { access_token: 'at-initial', ...(state.omitRefreshToken ? {} : { refresh_token: 'rt-secret' }), expires_in: 3600, scope: state.scope, id_token: idToken(state, form.get('client_id') ?? '') });
       }
       if (form.get('grant_type') === 'refresh_token') {
         if (state.revokeRefresh || form.get('refresh_token') !== 'rt-secret') return jsonRes(400, { error: 'invalid_grant' });

@@ -13,9 +13,16 @@ export interface StepConfigLike {
   timeout?: string | number;
 }
 
+export interface StepEvent<T> {
+  type: string;
+  payload: T;
+}
+
 export interface StepLike {
   do<T>(name: string, callback: () => Promise<T>): Promise<T>;
   do<T>(name: string, config: StepConfigLike, callback: () => Promise<T>): Promise<T>;
+  /** Waits for an event sent to this workflow instance; rejects when `timeout` (ms) elapses first. */
+  waitForEvent<T>(name: string, options: { type: string; timeout?: number | string }): Promise<StepEvent<T>>;
 }
 
 /**

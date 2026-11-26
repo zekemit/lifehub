@@ -44,6 +44,8 @@ export interface GuardedFetchOptions {
   maxRedirects?: number;
   /** Clock in ms. Default Date.now. */
   nowMs?: () => number;
+  /** Called (and awaited) when a request is refused because its host is on policy_blocklist, before PolicyBlockedError is thrown. */
+  onBlocked?: (blocked: PolicyBlockedError) => Promise<void> | void;
 }
 
 function normalizeHost(host: string): string {
@@ -92,7 +94,11 @@ export function createGuardedFetch(options: GuardedFetchOptions): typeof fetch {
       throw new EgressError(`only http(s) URLs may be fetched, got ${url.protocol}`);
     }
     const hit = matchBlocklist(url.hostname, await blocklist());
-    if (hit !== null) throw new PolicyBlockedError(normalizeHost(url.hostname), hit.domain, hit.reason);
+    if (hit !== null) {
+      const blocked = new PolicyBlockedError(normalizeHost(url.hostname), hit.domain, hit.reason);
+      await options.onBlocked?.(blocked);
+      throw blocked;
+    }
   }
 
   const guarded = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
