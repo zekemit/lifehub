@@ -1,0 +1,39 @@
+name = "lifehub"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+# Non-secret configuration. Source code reads these from `env`; it never hardcodes the brand or the domain.
+# Secrets (KEK_B64, OPENAI_API_KEY, ANTHROPIC_API_KEY) are set with `wrangler secret put`, never here.
+[vars]
+APP_NAME = "Keel"
+INBOUND_DOMAIN = "in.lifehub.app"
+
+# Durable ingestion pipelines (classes are exported from src/index.ts).
+[[workflows]]
+name = "ingest-email"
+binding = "INGEST_EMAIL_WF"
+class_name = "IngestEmailWF"
+
+[[workflows]]
+name = "ingest-file"
+binding = "INGEST_FILE_WF"
+class_name = "IngestFileWF"
+
+# Control + tenancy DB. Shard DBs (shard_00..03) are added as extra [[d1_databases]] bindings
+# when the repository layer lands; writeFact() already takes the target D1Database as an argument.
+# database_id is intentionally omitted: local dev and `wrangler d1 migrations apply DB --local` need none, and
+# `wrangler deploy` auto-provisions a missing D1 database / R2 bucket. To migrate the REMOTE database before the
+# first deploy, run `npx wrangler d1 create lifehub-control` and add the printed database_id under database_name.
+[[d1_databases]]
+binding = "DB"
+database_name = "lifehub-control"
+migrations_dir = "migrations"
+
+# Encrypted raw documents (MIME, PDFs, uploads). Objects are AES-GCM encrypted by the app before put().
+[[r2_buckets]]
+binding = "DOCS_BUCKET"
+bucket_name = "lifehub-docs"

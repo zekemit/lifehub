@@ -1,0 +1,28 @@
+{
+  "name": "lifehub",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Life Hub \u2014 consumer life OS and continuous context hub (Cloudflare Workers, D1, R2).",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
+    "test": "node scripts/test.mjs",
+    "check:bundle": "wrangler deploy --dry-run --outdir dist",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
+    "cf-typegen": "wrangler types"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261125.1",
+    "@types/node": "^22.20.7",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.168.0"
+  },
+  "dependencies": {
+    "postal-mime": "^4.2.1"
+  }
+}
