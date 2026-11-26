@@ -19,6 +19,7 @@ import {
   type CalendarDeps,
 } from '../connectors/googleCalendar';
 import type { Env } from '../types';
+import { trialGrantStatement } from '../billing/credits';
 import { error, json, newId } from './http';
 import {
   OAUTH_COOKIE, OAUTH_TTL_SECONDS, SESSION_COOKIE, SESSION_TTL_SECONDS, b64url, clearCookieHeader, openCookie, readCookie, sealCookie,
@@ -142,6 +143,8 @@ async function createHousehold(db: D1Database, email: string, name: string | nul
              SELECT ?4, ?1, ?3, ?5, 'owner', 1 WHERE EXISTS (SELECT 1 FROM households WHERE household_id = ?1) AND ${free}`,
           )
           .bind(household_id, '', email, member_id, name),
+        // Day-1 grant: enough for the three cold-start cards and one multi-credit goal. Idempotent, and only for the creation that won.
+        trialGrantStatement(db, household_id, new Date().toISOString(), member_id),
       ]);
       break;
     } catch (err) {

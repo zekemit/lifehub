@@ -6,7 +6,7 @@
 import { randomUUID } from 'node:crypto';
 import type { InboundMessage } from '../../src/workers/emailRouter';
 import type { StepConfigLike, StepEvent, StepLike } from '../../src/ingest/steps';
-import type { CalendarSyncParams, Env, IngestEmailParams, IngestFileParams, MissionRunParams, NightlySweepParams } from '../../src/types';
+import type { CalendarSyncParams, DropAlarmParams, Env, IngestEmailParams, IngestFileParams, LifeReceiptParams, MissionRunParams, NightlySweepParams, PriceWatchParams } from '../../src/types';
 import type { QueryCounter } from './index';
 
 // ── Workflow step (direct execution + accounting) ──
@@ -26,9 +26,35 @@ export interface WaitLogEntry {
   timeout: number | string | undefined;
 }
 
-export function directStep(counter?: QueryCounter, events: Record<string, EventScript> = {}): { step: StepLike; log: StepLogEntry[]; waits: WaitLogEntry[] } {
+export interface SleepLogEntry {
+  name: string;
+  duration: number | string;
+  ms: number;
+}
+
+const UNIT_MS: Record<string, number> = { second: 1000, minute: 60_000, hour: 3_600_000, day: 86_400_000, week: 604_800_000 };
+
+/** Milliseconds for a workflow sleep duration: a number is ms, text is '<n> <unit>' (seconds, minutes, hours, days, weeks). */
+export function durationMs(d: number | string): number {
+  if (typeof d === 'number') return d;
+  const m = /^(\d+(?:\.\d+)?)\s*(second|minute|hour|day|week)s?$/.exec(d.trim());
+  if (m === null) throw new Error(`unsupported sleep duration: ${d}`);
+  return Number(m[1]) * UNIT_MS[m[2]!]!;
+}
+
+/** A clock a test shares with the code under test; sleeping advances it, so a `sleep` is a jump forward in time, not a wait. */
+export interface TestClock {
+  now: Date;
+}
+
+export function directStep(
+  counter?: QueryCounter,
+  events: Record<string, EventScript> = {},
+  clock?: TestClock,
+): { step: StepLike; log: StepLogEntry[]; waits: WaitLogEntry[]; sleeps: SleepLogEntry[] } {
   const log: StepLogEntry[] = [];
   const waits: WaitLogEntry[] = [];
+  const sleeps: SleepLogEntry[] = [];
   const step: StepLike = {
     async do<T>(name: string, a: StepConfigLike | (() => Promise<T>), b?: () => Promise<T>): Promise<T> {
       const callback = (typeof a === 'function' ? a : b) as () => Promise<T>;
@@ -36,6 +62,11 @@ export function directStep(counter?: QueryCounter, events: Record<string, EventS
       const result = await callback();
       log.push({ name, queries: (counter?.count ?? 0) - before });
       return result;
+    },
+    async sleep(name: string, duration: number | string): Promise<void> {
+      const ms = durationMs(duration);
+      sleeps.push({ name, duration, ms });
+      if (clock !== undefined) clock.now = new Date(clock.now.getTime() + ms);
     },
     async waitForEvent<T>(name: string, options: { type: string; timeout?: number | string }): Promise<StepEvent<T>> {
       waits.push({ name, type: options.type, timeout: options.timeout });
@@ -46,7 +77,7 @@ export function directStep(counter?: QueryCounter, events: Record<string, EventS
       return { type: options.type, payload: payload as T };
     },
   };
-  return { step, log, waits };
+  return { step, log, waits, sleeps };
 }
 
 // ── fake LLM providers (network only) ──
@@ -126,8 +157,13 @@ export interface FakeWorkflows {
   calendar: Array<{ id: string; params: CalendarSyncParams }>;
   sweep: Array<{ id: string; params: NightlySweepParams }>;
   mission: Array<{ id: string; params: MissionRunParams }>;
+  receipt: Array<{ id: string; params: LifeReceiptParams }>;
+  alarm: Array<{ id: string; params: DropAlarmParams }>;
+  watch: Array<{ id: string; params: PriceWatchParams }>;
   /** Events sent to MissionRunWF instances: sendEvent({type, payload}). */
   events: Array<{ id: string; type: string; payload: unknown }>;
+  /** Events sent to DropAlarmWF instances. Kept apart so a test can tell WHICH Workflow an event was routed to. */
+  alarmEvents: Array<{ id: string; type: string; payload: unknown }>;
 }
 
 /** 32 random bytes, base64. */
@@ -143,12 +179,18 @@ const PROCESS_KEK = randomKek();
  * the real brand or domain would visibly misbehave.
  */
 export function testEnv(rt: { db: D1Database; bucket: R2Bucket; kv?: KVNamespace }, extra: Partial<Env> = {}): { env: Env; workflows: FakeWorkflows } {
-  const workflows: FakeWorkflows = { email: [], file: [], calendar: [], sweep: [], mission: [], events: [] };
+  const workflows: FakeWorkflows = { email: [], file: [], calendar: [], sweep: [], mission: [], receipt: [], alarm: [], watch: [], events: [], alarmEvents: [] };
   const recorder = <P>(list: Array<{ id: string; params: P }>) => ({
     create: async (o: { id: string; params: P }) => {
       if (list.some((w) => w.id === o.id)) throw new Error('instance already exists');
       list.push(o);
       return { id: o.id };
+    },
+  });
+  const eventTarget = (into: Array<{ id: string; type: string; payload: unknown }>) => async (id: string) => ({
+    id,
+    sendEvent: async (e: { type: string; payload: unknown }) => {
+      into.push({ id, type: e.type, payload: e.payload });
     },
   });
   const env = {
@@ -163,15 +205,10 @@ export function testEnv(rt: { db: D1Database; bucket: R2Bucket; kv?: KVNamespace
     INGEST_FILE_WF: recorder(workflows.file),
     CALENDAR_SYNC_WF: recorder(workflows.calendar),
     NIGHTLY_SWEEP_WF: recorder(workflows.sweep),
-    MISSION_RUN_WF: {
-      ...recorder(workflows.mission),
-      get: async (id: string) => ({
-        id,
-        sendEvent: async (e: { type: string; payload: unknown }) => {
-          workflows.events.push({ id, type: e.type, payload: e.payload });
-        },
-      }),
-    },
+    MISSION_RUN_WF: { ...recorder(workflows.mission), get: eventTarget(workflows.events) },
+    LIFE_RECEIPT_WF: recorder(workflows.receipt),
+    DROP_ALARM_WF: { ...recorder(workflows.alarm), get: eventTarget(workflows.alarmEvents) },
+    PRICE_WATCH_WF: recorder(workflows.watch),
     KV: rt.kv,
     GOOGLE_CLIENT_ID: 'client-id.apps.test',
     GOOGLE_CLIENT_SECRET: 'client-secret',

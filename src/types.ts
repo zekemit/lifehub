@@ -38,6 +38,9 @@ export interface Env {
   CALENDAR_SYNC_WF: Workflow<CalendarSyncParams>;
   NIGHTLY_SWEEP_WF: Workflow<NightlySweepParams>;
   MISSION_RUN_WF: Workflow<MissionRunParams>;
+  LIFE_RECEIPT_WF: Workflow<LifeReceiptParams>;
+  DROP_ALARM_WF: Workflow<DropAlarmParams>;
+  PRICE_WATCH_WF: Workflow<PriceWatchParams>;
   /** Encrypted OAuth tokens (wrangler.toml [[kv_namespaces]]). Values are AES-GCM under the household DEK. */
   KV: KVNamespace;
   /** Secrets (`wrangler secret put`): 32-byte base64 key-encryption key, and the two LLM provider keys. */
@@ -60,11 +63,43 @@ export interface Env {
   VAPID_PUBLIC_KEY?: string;
   VAPID_PRIVATE_KEY?: string;
   VAPID_SUBJECT?: string;
+  /** Stripe (secrets): API key for Checkout and off-session top-ups, and the webhook signing secret. Both are optional so the Worker still runs without billing. */
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
+  /** Duffel search-only API key (secret). Without it price watches check nothing. */
+  DUFFEL_API_KEY?: string;
+  /** Cloudflare Email Sending binding for the weekly Life Receipt. Without it receipts are stored and pushed but not e-mailed. */
+  RECEIPT_EMAIL?: EmailSender;
+}
+
+/** The part of Cloudflare's Email Sending binding the app uses. */
+export interface EmailSender {
+  send(message: { to: string; from: string; subject: string; text: string; html: string }): Promise<unknown>;
 }
 
 /** Payload of a MissionRunWF instance. Everything else is read from the mission_runs row. */
 export interface MissionRunParams {
   run_id: string;
+  household_id: string;
+}
+
+/** Payload of a LifeReceiptWF instance. `notify` sends the e-mail and push (the Sunday cron does; an on-demand receipt does not). */
+export interface LifeReceiptParams {
+  household_id: string;
+  notify: boolean;
+  /** ISO clock override for tests and replays. */
+  as_of?: IsoTimestamp;
+}
+
+/** Payload of a DropAlarmWF instance. The alarm row holds everything else. */
+export interface DropAlarmParams {
+  alarm_id: string;
+  household_id: string;
+}
+
+/** Payload of a PriceWatchWF instance. The price_watches row holds everything else. */
+export interface PriceWatchParams {
+  watch_id: string;
   household_id: string;
 }
 
@@ -211,6 +246,7 @@ export const MISSION_STATES = [
   'DECLINED',
   'FAILED_GATE',
   'CANCELED',
+  'INSUFFICIENT_CREDITS',
 ] as const;
 export type MissionState = (typeof MISSION_STATES)[number];
 
@@ -756,6 +792,7 @@ export const MISSION_STATE_TIER: Readonly<Record<MissionState, MissionTier | nul
   DECLINED: null,
   FAILED_GATE: null,
   CANCELED: null,
+  INSUFFICIENT_CREDITS: 'R0',
 };
 
 /**
@@ -765,7 +802,9 @@ export const MISSION_STATE_TIER: Readonly<Record<MissionState, MissionTier | nul
  * CANCELED is reachable from every state that has not reached an end state or issued the link.
  */
 export const MISSION_STATE_TRANSITIONS: Readonly<Record<MissionState, readonly MissionState[]>> = {
-  COMPILED: ['R0_READ', 'CANCELED'],
+  COMPILED: ['R0_READ', 'INSUFFICIENT_CREDITS', 'CANCELED'],
+  // The balance could not cover the run (and auto-recharge could not or may not): nothing was taken. A top-up and a new tap start it again.
+  INSUFFICIENT_CREDITS: ['COMPILED', 'DECLINED', 'CANCELED'],
   R0_READ: ['GATED', 'FAILED_GATE', 'CANCELED'],
   GATED: ['R1_STAGED', 'CANCELED'],
   // 'COMPILED': the member tapped the staged card, so MissionRunWF takes it over. 'DECLINED': "Not for me" on a staged card.

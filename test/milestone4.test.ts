@@ -214,19 +214,19 @@ test('MissionRunWF: a link nobody confirms stays R3_LINK_ISSUED; a confirmation 
 
 // ═══════════════ credits ═══════════════
 
-test('CREDITS: a household with no credit is CANCELED at debit_credit, takes nothing, calls nothing', async () => {
+test('CREDITS: a household with no credit halts as INSUFFICIENT_CREDITS at debit_credit, takes nothing, calls nothing', async () => {
   const s = await fx.buildScenario();
   const run_id = (await fx.stage(s.h))['annual_fee_roi']!;
   s.net.hosts.length = 0;
   const { outcome, log, waits } = await runWith(s, run_id);
-  assert.deepEqual(outcome, { status: 'canceled', reason: 'insufficient_credits' });
+  assert.deepEqual(outcome, { status: 'insufficient_credits', auto_recharge: 'disabled' });
   assert.deepEqual(log, ['compile', 'debit_credit']);
   assert.equal(waits.length, 0);
-  assert.equal(await stateOf(s, run_id), 'CANCELED');
+  assert.equal(await stateOf(s, run_id), 'INSUFFICIENT_CREDITS');
   assert.deepEqual(await ledgerOf(run_id), []);
   assert.equal(await fx.balance(s.h), 0, 'the balance never goes negative');
   assert.deepEqual(s.net.hosts, [], 'no model, calendar or push call was made');
-  assert.equal(await (await failureOf(s, run_id)).reason, 'insufficient_credits');
+  assert.equal((await failureOf(s, run_id)).reason, 'INSUFFICIENT_CREDITS');
 });
 
 test('CREDITS: a finished run cannot be started again, so it cannot be charged twice', async () => {
@@ -292,7 +292,7 @@ test('GATE FAILURE G7: tax language in the model-written script refuses the card
   }
 });
 
-test('GATE FAILURE G8: a run over $0.60, or a worker budget the input exceeds, refunds and halts', async () => {
+test('GATE FAILURE G8: a run over its per-credit cost cap, or a worker budget the input exceeds, refunds and halts', async () => {
   // spend already booked against the run pushes it over the cap
   const over = await fx.buildScenario();
   await fx.grant(over.h, 1);
@@ -461,6 +461,7 @@ async function gateBase(): Promise<{ input: GateInput; h: Household; feeFact: st
       expires_on: null,
     },
     r3: true,
+    credit_cost: 1,
   };
   return { input, h, feeFact };
 }
@@ -498,7 +499,7 @@ test('GATES: each gate fails when its rule is broken, and only the gates that br
     ['G6', (i) => { i.max_tier = 'R2'; }],
     ['G6', (i) => { i.payload.action = { type: 'none' }; }],
     ['G7', (i) => { i.payload.script = 'That is a deductible expense.'; }],
-    ['G8', async (i) => { await rt.db.prepare(`INSERT INTO llm_usage (id, household_id, run_id, model, input_tokens, cached_tokens, output_tokens, cost_usd) VALUES (?, ?, ?, 'm', 10, 0, 10, 0.6001)`).bind(`u_${randomUUID()}`, i.household_id, i.run_id).run(); }],
+    ['G8', async (i) => { await rt.db.prepare(`INSERT INTO llm_usage (id, household_id, run_id, model, input_tokens, cached_tokens, output_tokens, cost_usd) VALUES (?, ?, ?, 'm', 10, 0, 10, 0.2501)`).bind(`u_${randomUUID()}`, i.household_id, i.run_id).run(); }],
     ['G8', async (i) => { await rt.db.prepare(`INSERT INTO llm_usage (id, household_id, run_id, model, input_tokens, cached_tokens, output_tokens, cost_usd) VALUES (?, ?, ?, 'm', 90001, 0, 10, 0.01)`).bind(`u_${randomUUID()}`, i.household_id, i.run_id).run(); }],
     ['G8', (i) => { i.fill_failure = 'worker input exceeds the template budget'; }],
     ['G9', async (i, ctx) => { await seedRun(ctx.h, { dedupe_key: i.dedupe_key, template_key: i.template_key, state: 'R2_AWAITING' }); }],
@@ -536,7 +537,7 @@ test('GATES: boundaries are inclusive exactly where the spec says (35 days, 15 m
   assert.deepEqual(await ok((i) => { i.payload.proposed_range = { start: i.read.calendar.windows[0]!.start, end: i.read.calendar.windows[0]!.end }; }), [], 'the proposed time may fill the window exactly');
   assert.deepEqual(await ok((i) => { const w = i.read.calendar.windows[0]!; i.payload.proposed_range = { start: w.start, end: new Date(Date.parse(w.end) + 1).toISOString() }; }), ['G4'], 'one millisecond past the window end');
   assert.deepEqual(await ok((i) => { const w = i.read.calendar.windows[0]!; i.payload.proposed_range = { start: new Date(Date.parse(w.start) - 1).toISOString(), end: w.end }; }), ['G4'], 'one millisecond before the window start');
-  assert.deepEqual(await ok(async (i) => { await rt.db.prepare(`INSERT INTO llm_usage (id, household_id, run_id, model, input_tokens, cached_tokens, output_tokens, cost_usd) VALUES (?, ?, ?, 'm', 90000, 0, 10, 0.6)`).bind(`u_${randomUUID()}`, i.household_id, i.run_id).run(); }), [], '$0.60 and 90,000 tokens are allowed');
+  assert.deepEqual(await ok(async (i) => { await rt.db.prepare(`INSERT INTO llm_usage (id, household_id, run_id, model, input_tokens, cached_tokens, output_tokens, cost_usd) VALUES (?, ?, ?, 'm', 90000, 0, 10, 0.25)`).bind(`u_${randomUUID()}`, i.household_id, i.run_id).run(); }), [], '$0.25 (one credit) and 90,000 tokens are allowed');
   // a card that spends no money needs no headroom, and one without an envelope cannot be measured
   assert.deepEqual(await ok((i) => { i.payload.price_cents = 0; i.read.headroom_cents = null; }), []);
   assert.deepEqual(await ok((i) => { i.payload.envelope_key = null; i.read.headroom_cents = null; i.read.envelope_key = null; }), []);
@@ -631,12 +632,12 @@ test('LEDGER: debit is atomic and conditional, so racing missions can never over
   const big = await seedRun(poor);
   assert.deepEqual(await debitCredit(rt.db, poor.household_id, big, 2, at), { ok: false, balance: 1 });
   assert.equal(await creditBalance(rt.db, poor.household_id), 1);
-  assert.deepEqual(await debitCredit(rt.db, poor.household_id, await seedRun(poor), 0, at), { ok: true, debited: false, balance: 1 });
+  assert.deepEqual(await debitCredit(rt.db, poor.household_id, await seedRun(poor), 0, at), { ok: true, debited: false, balance: 1, from_subscription: 0, from_purchased: 0 });
 
   // the same run debits once: a retried step is a no-op that still reports success
   const run = await seedRun(poor);
-  assert.deepEqual(await debitCredit(rt.db, poor.household_id, run, 1, at), { ok: true, debited: true, balance: 0 });
-  assert.deepEqual(await debitCredit(rt.db, poor.household_id, run, 1, at), { ok: true, debited: false, balance: 0 });
+  assert.deepEqual(await debitCredit(rt.db, poor.household_id, run, 1, at), { ok: true, debited: true, balance: 0, from_subscription: 1, from_purchased: 0 });
+  assert.deepEqual(await debitCredit(rt.db, poor.household_id, run, 1, at), { ok: true, debited: false, balance: 0, from_subscription: 1, from_purchased: 0 });
 
   // refund: once, only against an existing debit, never for another household's run
   const stranger = await makeHousehold(rt.db);
@@ -937,7 +938,7 @@ test('AUTH CALLBACK: a new member gets a household, encrypted calendar tokens, a
   const hh = await fx.one<{ plan: string; shard: number; alias_local: string; timezone: string }>('SELECT plan, shard, alias_local, timezone FROM households WHERE household_id = ?', member.household_id);
   assert.deepEqual([hh.plan, hh.shard, hh.timezone], ['trial', 0, 'America/New_York']);
   assert.match(hh.alias_local, /^h_[a-z2-7]{10}$/);
-  assert.equal(await creditBalance(rt.db, member.household_id), 0, 'a new household starts with no credits; grants come from Stripe');
+  assert.equal(await creditBalance(rt.db, member.household_id), 5, 'a new household gets the Day-1 trial grant');
   const audits = (await fx.all<{ action: string; detail_json: string }>(`SELECT action, detail_json FROM audit_log WHERE household_id = ? AND actor = 'auth' ORDER BY action`, member.household_id));
   assert.deepEqual(audits.map((a) => a.action), ['household_created', 'signin']);
   assert.ok(audits.every((a) => !/rt-secret|at-initial|good-code/.test(a.detail_json)), 'no token or code is logged');
@@ -1313,7 +1314,7 @@ test('CAPACITY: a card in flight or awaiting a decision holds a Home slot; one t
   const h = await makeHousehold(rt.db);
   for (const state of CAPACITY_STATES) await seedRun(h, { state });
   assert.equal(await activeStagedCount(rt.db, h.household_id), CAPACITY_STATES.length);
-  assert.deepEqual([...CAPACITY_STATES], ['COMPILED', 'R0_READ', 'GATED', 'R1_STAGED', 'R2_AWAITING', 'R2_APPROVED']);
+  assert.deepEqual([...CAPACITY_STATES], ['COMPILED', 'R0_READ', 'GATED', 'R1_STAGED', 'R2_AWAITING', 'R2_APPROVED', 'INSUFFICIENT_CREDITS']);
   for (const state of ['R3_LINK_ISSUED', 'CONFIRMED', 'EXPIRED', 'DECLINED', 'FAILED_GATE', 'CANCELED']) await seedRun(h, { state });
   assert.equal(await activeStagedCount(rt.db, h.household_id), CAPACITY_STATES.length);
 });
@@ -1353,7 +1354,7 @@ test('STRUCTURE: MissionRunWF is bound and exported, the Workflow class is a thi
   const files = ['src/missions/gates.ts', 'src/missions/runPipeline.ts', 'src/missions/ledger.ts', 'src/missions/runState.ts', 'src/missions/deeplinks.ts', 'src/notify/webPush.ts', 'src/workers/auth.ts', 'src/workers/missions.ts', 'src/workflows/missionRunWF.ts'];
   for (const f of files) {
     const code = read(f).replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
-    assert.ok(!/api\.stripe\.com|duffel|payment_intent|paymentMethod|card_number|cvv|routing_number/i.test(code), `${f} must not touch payment APIs or card data`);
+    assert.ok(!/api\.stripe\.com|api\.duffel\.com|payment_intent|paymentMethod|card_number|cvv|routing_number/i.test(code), `${f} must not touch payment APIs or card data (Stripe lives in src/billing, Duffel in src/travel)`);
     assert.ok(!/(?<!async\s)(?<![.\w$])fetch\s*\(/.test(code), `${f} must not call the global fetch()`);
   }
 });

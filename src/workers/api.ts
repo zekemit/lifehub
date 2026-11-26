@@ -21,9 +21,13 @@ import { findCalendarConnector } from '../connectors/googleCalendar';
 import { getHome } from '../missions/home';
 import { createGuardedFetch } from '../net/egress';
 import type { Env, IngestFileParams, SignConvention } from '../types';
+import { handleStripeWebhook } from '../billing/stripeWebhook';
 import { authenticate, handleGoogleCallback, handleGoogleLogin, handleLogout, handleMe, passesCsrf, type Auth } from './auth';
 import { error, isAlreadyExists, json } from './http';
+import { handleAutoRecharge, handleBalance, handleCheckout } from './billing';
+import { handleConciergeAction, handleCreateAlarm, handleCreateWatch, parseConciergePath } from './concierge';
 import { handleMission, handlePushSubscribe, parseMissionPath } from './missions';
+import { handleReceiptGenerate, handleReceiptLatest, handleShareCard } from './receipt';
 
 export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 
@@ -117,10 +121,19 @@ const ROUTES: Readonly<Record<string, string>> = {
   '/api/auth/me': 'GET',
   '/api/auth/logout': 'POST',
   '/api/push/subscribe': 'POST',
+  '/api/credits/balance': 'GET',
+  '/api/credits/checkout': 'POST',
+  '/api/credits/auto-recharge': 'POST',
+  '/api/receipt/latest': 'GET',
+  '/api/receipt/generate': 'POST',
+  '/api/receipt/share-card.svg': 'GET',
+  '/api/drop-alarms': 'POST',
+  '/api/price-watches': 'POST',
 };
-const PUBLIC_ROUTES: Readonly<Record<string, string>> = { '/api/auth/google/login': 'GET', '/api/auth/google/callback': 'GET' };
+/** No session: Google's sign-in redirects, and Stripe's webhook (authenticated by its signature, not a cookie, so no CSRF check either). */
+const PUBLIC_ROUTES: Readonly<Record<string, string>> = { '/api/auth/google/login': 'GET', '/api/auth/google/callback': 'GET', '/api/webhooks/stripe': 'POST' };
 
-/** `deps.fetch` is the network used for Google's token endpoint; production gets the policy-guarded fetch. */
+/** `deps.fetch` is the network used for Google's token endpoint and for Stripe; production gets the policy-guarded fetch. */
 export async function handleApi(request: Request, env: Env, deps: { now?: () => Date; fetch?: typeof fetch } = {}): Promise<Response> {
   const nowFn = deps.now ?? (() => new Date());
   const now = nowFn();
@@ -129,12 +142,14 @@ export async function handleApi(request: Request, env: Env, deps: { now?: () => 
   const publicMethod = PUBLIC_ROUTES[path];
   if (publicMethod !== undefined) {
     if (request.method !== publicMethod) return json(405, { error: 'method_not_allowed', message: `Use ${publicMethod}.` }, { allow: publicMethod });
+    if (path === '/api/webhooks/stripe') return handleStripeWebhook(request, env, { now: nowFn });
     const authDeps = { now: nowFn, fetch: deps.fetch ?? createGuardedFetch({ db: env.DB }) };
     return path === '/api/auth/google/login' ? handleGoogleLogin(request, env, authDeps) : handleGoogleCallback(request, env, authDeps);
   }
 
   const mission = parseMissionPath(path);
-  const method = mission !== null ? 'POST' : ROUTES[path];
+  const concierge = parseConciergePath(path);
+  const method = mission !== null || concierge !== null ? 'POST' : ROUTES[path];
   if (method === undefined) return error(404, 'not_found', 'No such endpoint.');
   if (request.method !== method) return json(405, { error: 'method_not_allowed', message: `Use ${method}.` }, { allow: method });
 
@@ -143,6 +158,8 @@ export async function handleApi(request: Request, env: Env, deps: { now?: () => 
   if (!passesCsrf(request, auth)) return error(403, 'csrf', 'Cross-site request refused.');
 
   if (mission !== null) return handleMission(request, env, auth, mission, now);
+  if (concierge !== null) return handleConciergeAction(env, auth, concierge);
+  const network = deps.fetch ?? createGuardedFetch({ db: env.DB });
   switch (path) {
     case '/api/ingest/file':
       return ingestFile(request, env, auth);
@@ -154,6 +171,22 @@ export async function handleApi(request: Request, env: Env, deps: { now?: () => 
       return handleLogout();
     case '/api/push/subscribe':
       return handlePushSubscribe(request, env, auth);
+    case '/api/credits/balance':
+      return handleBalance(env, auth, now);
+    case '/api/credits/checkout':
+      return handleCheckout(request, env, auth, { fetch: network });
+    case '/api/credits/auto-recharge':
+      return handleAutoRecharge(request, env, auth, now);
+    case '/api/receipt/latest':
+      return handleReceiptLatest(env, auth, { fetch: network, now: nowFn });
+    case '/api/receipt/generate':
+      return handleReceiptGenerate(env, auth, { fetch: network, now: nowFn });
+    case '/api/receipt/share-card.svg':
+      return handleShareCard(env, auth);
+    case '/api/drop-alarms':
+      return handleCreateAlarm(request, env, auth, now);
+    case '/api/price-watches':
+      return handleCreateWatch(request, env, auth, now);
     default:
       return json(200, await getHome(env.DB, auth.household_id, now));
   }

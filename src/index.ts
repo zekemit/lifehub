@@ -8,10 +8,13 @@ import { runScheduled } from './workers/scheduled';
 import type { Env } from './types';
 
 export { CalendarSyncWF } from './workflows/calendarSyncWF';
+export { DropAlarmWF } from './workflows/dropAlarmWF';
 export { IngestEmailWF } from './workflows/ingestEmailWF';
 export { IngestFileWF } from './workflows/ingestFileWF';
+export { LifeReceiptWF } from './workflows/lifeReceiptWF';
 export { MissionRunWF } from './workflows/missionRunWF';
 export { NightlySweepWF } from './workflows/nightlySweepWF';
+export { PriceWatchWF } from './workflows/priceWatchWF';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {

@@ -11,7 +11,7 @@
  *   G5 policy       nothing this run fetches is on policy_blocklist, and no egress attempt was blocked
  *   G6 tier         every plan step respects max_tier, R3 steps are deep links, and an R3 run has a link to issue
  *   G7 tax-language no tax characterization anywhere in the card or its script
- *   G8 cost         run cost <= $0.60 and no model call above 90,000 input tokens
+ *   G8 cost         run cost <= $0.25 per credit charged and no model call above 90,000 input tokens
  *   G9 idempotency  no other open run, or run inside the cooldown, for the same template and dedupe_key
  */
 
@@ -21,7 +21,9 @@ import { matchBlocklist } from '../net/egress';
 import { WORKER_INPUT_TOKEN_CEILING } from '../llm/gateway';
 import { isTierAllowed, type MissionTier } from '../types';
 
-export const MAX_RUN_COST_USD = 0.6;
+/** Gate G8: model spend a run may cost, per credit it charges (1 credit = $0.25, 3 = $0.75, 5 = $1.25). */
+export const COST_CAP_USD_PER_CREDIT = 0.25;
+export const maxRunCostUsd = (creditCost: number): number => COST_CAP_USD_PER_CREDIT * Math.max(1, creditCost);
 export const MONEY_MAX_AGE_DAYS = 35;
 export const CALENDAR_MAX_AGE_MS = 15 * 60_000;
 /** G3: the price plus 10% must fit. Compared as price * 11 <= headroom * 10 so no float rounding decides it. */
@@ -72,7 +74,7 @@ export interface CardPayload {
   template_key: string;
   trigger_key: string;
   dedupe_key: string;
-  kind: 'use_credit' | 'retention_script' | 'dinner_plan' | 'cancel_script' | 'plan';
+  kind: 'use_credit' | 'retention_script' | 'dinner_plan' | 'cancel_script' | 'plan' | 'drop_alarm' | 'flight_deal';
   copy: CardCopy;
   /** Model-written script text (retention / cancel calls). Assistive only, never a claim. */
   script: string | null;
@@ -110,6 +112,8 @@ export interface GateInput {
   payload: CardPayload;
   /** True for the re-gate that precedes issuing the deep link. */
   r3: boolean;
+  /** Credits this run charges; Gate G8's cost cap scales with it. */
+  credit_cost: number;
   /** Set when the worker step could not run inside its token budget (the call was refused, so llm_usage has no row for it). */
   fill_failure?: string | null;
 }
@@ -149,12 +153,17 @@ function g2(i: GateInput): GateResult {
   return result('G2', 'freshness', problems.length === 0, problems.length === 0 ? 'supporting data is current' : problems.join('; '));
 }
 
+/** Gate G3's rule, shared with the price watch's pre-check: price + 10% must fit in the headroom. */
+export function fitsHeadroom(priceCents: number, headroomCents: number): boolean {
+  return priceCents * HEADROOM_MARGIN_NUM <= headroomCents * HEADROOM_MARGIN_DEN;
+}
+
 function g3(i: GateInput): GateResult {
   const price = i.payload.price_cents;
   if (price <= 0 || i.payload.envelope_key === null) return result('G3', 'headroom', true, 'this card spends no money');
   const headroom = i.read.headroom_cents;
   if (headroom === null) return result('G3', 'headroom', false, `no headroom is known for envelope ${i.payload.envelope_key}`);
-  const ok = price * HEADROOM_MARGIN_NUM <= headroom * HEADROOM_MARGIN_DEN;
+  const ok = fitsHeadroom(price, headroom);
   return result('G3', 'headroom', ok, `price ${price} + 10% ${ok ? 'fits' : 'does not fit'} in headroom ${headroom}`);
 }
 
@@ -211,12 +220,13 @@ async function g8(i: GateInput): Promise<GateResult> {
   const cost = row?.cost ?? 0;
   const maxIn = row?.max_in ?? 0;
   const failure = i.fill_failure ?? null;
-  const ok = cost <= MAX_RUN_COST_USD && maxIn <= WORKER_INPUT_TOKEN_CEILING && failure === null;
+  const cap = maxRunCostUsd(i.credit_cost);
+  const ok = cost <= cap && maxIn <= WORKER_INPUT_TOKEN_CEILING && failure === null;
   return result(
     'G8',
     'cost',
     ok,
-    `cost $${cost.toFixed(4)} (cap $${MAX_RUN_COST_USD}), largest call ${maxIn} input tokens (cap ${WORKER_INPUT_TOKEN_CEILING})${failure === null ? '' : `; ${failure}`}`,
+    `cost $${cost.toFixed(4)} (cap $${cap.toFixed(2)} for ${i.credit_cost} credit${i.credit_cost === 1 ? '' : 's'}), largest call ${maxIn} input tokens (cap ${WORKER_INPUT_TOKEN_CEILING})${failure === null ? '' : `; ${failure}`}`,
   );
 }
 

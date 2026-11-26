@@ -10,7 +10,7 @@ import { ACTIVE_STATES, HOME_CAPACITY, loadVerifiedEvidence, type Evidence } fro
 import type { MissionState } from '../types';
 
 /** States a card can be shown in: staged, in flight in MissionRunWF, awaiting the member, or holding an issued link. */
-const HOME_STATES = ['COMPILED', 'R0_READ', 'GATED', 'R1_STAGED', 'R2_AWAITING', 'R2_APPROVED', 'R3_LINK_ISSUED'] as const;
+const HOME_STATES = ['COMPILED', 'R0_READ', 'GATED', 'R1_STAGED', 'R2_AWAITING', 'R2_APPROVED', 'R3_LINK_ISSUED', 'INSUFFICIENT_CREDITS'] as const;
 
 export interface EvidenceChip {
   claim_id: string;
@@ -40,6 +40,8 @@ export interface HomeCard {
   script: string | null;
   /** The issued deep link, once MissionRunWF has reached R3. */
   link: HomeLink | null;
+  /** Set when the run halted because the credits did not cover it: where to top up, and why auto-recharge did not. */
+  top_up: { endpoint: string; auto_recharge: string | null } | null;
   trigger_key: string;
   title: string;
   why: string;
@@ -103,7 +105,7 @@ export async function getHome(db: D1Database, household_id: string, now: Date): 
     .prepare(
       `SELECT run_id, state, params_json, expires_at FROM mission_runs
         WHERE household_id = ? AND state IN (${HOME_STATES.map((s) => `'${s}'`).join(', ')}) AND (expires_at IS NULL OR expires_at >= ?)
-        ORDER BY CASE state WHEN 'R3_LINK_ISSUED' THEN 0 WHEN 'R2_APPROVED' THEN 1 ELSE 2 END,
+        ORDER BY CASE state WHEN 'R3_LINK_ISSUED' THEN 0 WHEN 'R2_APPROVED' THEN 1 WHEN 'R2_AWAITING' THEN 2 WHEN 'INSUFFICIENT_CREDITS' THEN 3 ELSE 4 END,
                  json_extract(params_json, '$.score') DESC, created_at DESC, run_id
         LIMIT ?`,
     )
@@ -151,6 +153,10 @@ export async function getHome(db: D1Database, household_id: string, now: Date): 
       state: run.state,
       payload_hash: typeof p['payload_hash'] === 'string' ? p['payload_hash'] : null,
       script: typeof payload?.script === 'string' ? payload.script : null,
+      top_up:
+        run.state === 'INSUFFICIENT_CREDITS'
+          ? { endpoint: '/api/credits/checkout', auto_recharge: typeof (p['failure'] as { auto_recharge?: unknown } | undefined)?.auto_recharge === 'string' ? String((p['failure'] as { auto_recharge: string }).auto_recharge) : null }
+          : null,
       link:
         link !== null && link !== undefined && typeof link.url === 'string'
           ? { url: link.url, merchant_domain: String(link.merchant_domain ?? ''), affiliate_program: typeof link.affiliate_program === 'string' ? link.affiliate_program : null, issued_at: String(link.issued_at ?? '') }

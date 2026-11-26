@@ -267,7 +267,7 @@ export async function expireStaleRuns(db: D1Database, household_id: string, now:
 }
 
 /** Cards that hold one of the household's HOME_CAPACITY slots: staged, in flight in MissionRunWF, or approved and awaiting their link. */
-export const CAPACITY_STATES = ['COMPILED', 'R0_READ', 'GATED', 'R1_STAGED', 'R2_AWAITING', 'R2_APPROVED'] as const;
+export const CAPACITY_STATES = ['COMPILED', 'R0_READ', 'GATED', 'R1_STAGED', 'R2_AWAITING', 'R2_APPROVED', 'INSUFFICIENT_CREDITS'] as const;
 
 export async function activeStagedCount(db: D1Database, household_id: string): Promise<number> {
   const row = await db
@@ -281,15 +281,22 @@ const newRunId = (): string => `run_${crypto.randomUUID().replace(/-/g, '')}`;
 const newId = (prefix: string): string => `${prefix}_${crypto.randomUUID().replace(/-/g, '')}`;
 
 function expiresAtOf(data: Record<string, unknown>): string | null {
+  const at = data['expires_at'];
+  if (typeof at === 'string' && Number.isFinite(Date.parse(at))) return new Date(at).toISOString();
   const on = data['expires_on'];
   return typeof on === 'string' && /^\d{4}-\d{2}-\d{2}/.test(on) ? `${on.slice(0, 10)}T23:59:59.999Z` : null;
 }
 
-/** Inserts the run, its claims, their support and the gate steps in one batch. */
-async function insertRun(
+/** Inserts the run, its claims, their support and the gate steps in one batch. Also used by the concierge workflows for their own cards. */
+export async function insertRun(
   db: D1Database,
   household_id: string,
   o: {
+    /** Use this run id (the concierge workflows derive theirs from the alarm or watch, so a retried step finds its own row). */
+    run_id?: string;
+    origin?: 'trigger' | 'user';
+    /** Merged into params_json (e.g. the Workflow that owns the run). */
+    extra_params?: Record<string, unknown>;
     template_key: string;
     trigger_key: string;
     dedupe_key: string;
@@ -303,7 +310,7 @@ async function insertRun(
     now: Date;
   },
 ): Promise<string> {
-  const run_id = newRunId();
+  const run_id = o.run_id ?? newRunId();
   const iso = o.now.toISOString();
   const claimIds = o.claims.map(() => newId('clm'));
   const params = {
@@ -319,14 +326,15 @@ async function insertRun(
     unconfirmed: o.copy.unconfirmed,
     data: o.data,
     claim_ids: claimIds,
+    ...(o.extra_params ?? {}),
   };
   const statements: D1PreparedStatement[] = [
     db
       .prepare(
         `INSERT INTO mission_runs (run_id, household_id, template_key, template_version, origin, params_json, state, expires_at, cost_usd, created_at, updated_at)
-         SELECT ?, ?, template_key, version, 'trigger', ?, 'R1_STAGED', ?, 0, ?, ? FROM mission_templates WHERE template_key = ? ORDER BY version DESC LIMIT 1`,
+         SELECT ?, ?, template_key, version, ?, ?, 'R1_STAGED', ?, 0, ?, ? FROM mission_templates WHERE template_key = ? ORDER BY version DESC LIMIT 1`,
       )
-      .bind(run_id, household_id, JSON.stringify(params), expiresAtOf(o.data), iso, iso, o.template_key),
+      .bind(run_id, household_id, o.origin ?? 'trigger', JSON.stringify(params), expiresAtOf(o.data), iso, iso, o.template_key),
   ];
   for (const [i, claim] of o.claims.entries()) {
     const claim_id = claimIds[i]!;
