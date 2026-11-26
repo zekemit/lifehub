@@ -202,6 +202,16 @@ test('ROLLOVER: a renewal expires unused subscription credits above 15, then gra
   assert.deepEqual(await creditBalances(rt.db, h.household_id), { total: 65, subscription: 30, purchased: 35 });
   assert.deepEqual(await grantMonthly(rt.db, h.household_id, { key: 'evt_renewal_2', credits: 15 }, AT()), { granted: true, expired: 15 });
   assert.deepEqual(await creditBalances(rt.db, h.household_id), { total: 65, subscription: 30, purchased: 35 });
+
+  // a renewal that expired NOTHING (under the cap), replayed after the balance has grown past the cap, must still expire nothing:
+  // there is no earlier expiry row to make the insert a no-op, so only "this event was already processed" protects the credits
+  const quiet = await makeHousehold(rt.db);
+  await fx.grant(quiet, 10);
+  assert.deepEqual(await grantMonthly(rt.db, quiet.household_id, { key: 'evt_quiet', credits: 15 }, AT()), { granted: true, expired: 0 });
+  assert.equal((await creditBalances(rt.db, quiet.household_id)).subscription, 25);
+  assert.deepEqual(await grantMonthly(rt.db, quiet.household_id, { key: 'evt_quiet', credits: 15 }, AT()), { granted: false, expired: 0 }, 'a replay');
+  assert.equal((await creditBalances(rt.db, quiet.household_id)).subscription, 25, 'still 25: the replay expired nothing');
+  assert.equal((await fx.all(`SELECT 1 FROM credit_ledger WHERE household_id = ? AND reason = 'expiry'`, quiet.household_id)).length, 0);
 });
 
 test('ROLLOVER: the cap is exact (15 stays, 16 loses one), and packs of every size survive any number of renewals', async () => {
@@ -1058,6 +1068,7 @@ test('LIFE RECEIPT G1/G7: a line whose evidence no longer verifies, or that char
       { text: 'No facts listed', cents: 2_000, claim_id: 'c_empty' },
       { text: 'This fee is tax deductible', cents: 1_000, claim_id: 'c_tax_claim' },
       { text: 'You can deduct this fee', cents: 900, claim_id: 'c_tax_line' },
+      { text: 'An annual fee is on file', cents: 800, claim_id: 'c_tax_claim_only' },
     ],
     done: [],
     waiting: [
@@ -1074,6 +1085,8 @@ test('LIFE RECEIPT G1/G7: a line whose evidence no longer verifies, or that char
       { claim_id: 'c_empty', text: 'Something', facts: [] },
       { claim_id: 'c_tax_claim', text: 'The fee is deductible', facts: [good] },
       { claim_id: 'c_tax_line', text: 'The card has an annual fee', facts: [good] },
+      // the line says nothing about tax, but the claim (which the proof section prints) does
+      { claim_id: 'c_tax_claim_only', text: 'You can deduct the annual fee', facts: [good] },
     ],
     counts: { documents_filed: 0, facts_updated: 0, habits_decayed: 0, missions_completed: 0 },
   };
@@ -1082,7 +1095,7 @@ test('LIFE RECEIPT G1/G7: a line whose evidence no longer verifies, or that char
   assert.equal(payload.found.total_cents, 89_500, 'the total is recomputed from what is left');
   assert.deepEqual(payload.waiting.map((w) => w.run_id), ['run_2'], 'the claim-free "forward receipts" card is kept; the tax-worded and ungrounded cards are not');
   const dropped = payload.dropped.map((d) => `${d.gate}:${d.claim_id}`).sort();
-  assert.deepEqual(dropped, ['G1:c_damaged', 'G1:c_empty', 'G1:c_missing_fact', 'G1:c_null', 'G7:c_good', 'G7:c_tax_claim', 'G7:c_tax_line'], 'each failure is recorded once, with its gate');
+  assert.deepEqual(dropped, ['G1:c_damaged', 'G1:c_empty', 'G1:c_missing_fact', 'G1:c_null', 'G7:c_good', 'G7:c_tax_claim', 'G7:c_tax_claim_only', 'G7:c_tax_line'], 'each failure is recorded once, with its gate');
   assert.deepEqual(payload.proof.map((p) => p.claim_id), ['c_good'], 'only claims that survived are shown as proof');
   assert.ok(!JSON.stringify(payload).match(/deduct/i), 'no tax language anywhere in what would be stored or sent');
 });
@@ -1580,16 +1593,17 @@ test('API drop alarms: creating one starts DropAlarmWF under the alarm id; event
         const hash = (await getRun(rt.db, s.h.household_id, run_id))!.params['payload_hash'];
         assert.equal((await post(`/api/missions/${run_id}/start`, {})).status, 200, 'the card is already running inside its alarm workflow');
         assert.equal((await post(`/api/missions/${run_id}/approve`, { payload_hash: hash })).status, 202);
-        return s.workflows.events.find((e) => e.type === `approve:${run_id}`)!.payload;
+        return s.workflows.alarmEvents.find((e) => e.type === `approve:${run_id}`)!.payload;
       },
       [`confirmed:${run_id}`]: async () => {
         assert.equal((await post(`/api/missions/${run_id}/confirm`, {})).status, 202);
-        return s.workflows.events.find((e) => e.type === `confirmed:${run_id}`)!.payload;
+        return s.workflows.alarmEvents.find((e) => e.type === `confirmed:${run_id}`)!.payload;
       },
     },
   });
   assert.equal(outcome.status, 'confirmed');
-  assert.deepEqual(s.workflows.events.map((e) => e.id), [alarm_id, alarm_id], 'both events went to the alarm\'s workflow instance');
+  assert.deepEqual(s.workflows.alarmEvents.map((e) => [e.id, e.type]), [[alarm_id, `approve:${run_id}`], [alarm_id, `confirmed:${run_id}`]], 'both events went to the alarm\'s DropAlarmWF instance');
+  assert.equal(s.workflows.events.length, 0, 'and none to MissionRunWF');
   assert.equal(s.workflows.mission.length, 0, 'MissionRunWF never started');
 
   // cancel: owner only, idempotent

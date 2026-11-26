@@ -162,6 +162,8 @@ export interface FakeWorkflows {
   watch: Array<{ id: string; params: PriceWatchParams }>;
   /** Events sent to MissionRunWF instances: sendEvent({type, payload}). */
   events: Array<{ id: string; type: string; payload: unknown }>;
+  /** Events sent to DropAlarmWF instances. Kept apart so a test can tell WHICH Workflow an event was routed to. */
+  alarmEvents: Array<{ id: string; type: string; payload: unknown }>;
 }
 
 /** 32 random bytes, base64. */
@@ -177,7 +179,7 @@ const PROCESS_KEK = randomKek();
  * the real brand or domain would visibly misbehave.
  */
 export function testEnv(rt: { db: D1Database; bucket: R2Bucket; kv?: KVNamespace }, extra: Partial<Env> = {}): { env: Env; workflows: FakeWorkflows } {
-  const workflows: FakeWorkflows = { email: [], file: [], calendar: [], sweep: [], mission: [], receipt: [], alarm: [], watch: [], events: [] };
+  const workflows: FakeWorkflows = { email: [], file: [], calendar: [], sweep: [], mission: [], receipt: [], alarm: [], watch: [], events: [], alarmEvents: [] };
   const recorder = <P>(list: Array<{ id: string; params: P }>) => ({
     create: async (o: { id: string; params: P }) => {
       if (list.some((w) => w.id === o.id)) throw new Error('instance already exists');
@@ -185,10 +187,10 @@ export function testEnv(rt: { db: D1Database; bucket: R2Bucket; kv?: KVNamespace
       return { id: o.id };
     },
   });
-  const eventTarget = async (id: string) => ({
+  const eventTarget = (into: Array<{ id: string; type: string; payload: unknown }>) => async (id: string) => ({
     id,
     sendEvent: async (e: { type: string; payload: unknown }) => {
-      workflows.events.push({ id, type: e.type, payload: e.payload });
+      into.push({ id, type: e.type, payload: e.payload });
     },
   });
   const env = {
@@ -203,9 +205,9 @@ export function testEnv(rt: { db: D1Database; bucket: R2Bucket; kv?: KVNamespace
     INGEST_FILE_WF: recorder(workflows.file),
     CALENDAR_SYNC_WF: recorder(workflows.calendar),
     NIGHTLY_SWEEP_WF: recorder(workflows.sweep),
-    MISSION_RUN_WF: { ...recorder(workflows.mission), get: eventTarget },
+    MISSION_RUN_WF: { ...recorder(workflows.mission), get: eventTarget(workflows.events) },
     LIFE_RECEIPT_WF: recorder(workflows.receipt),
-    DROP_ALARM_WF: { ...recorder(workflows.alarm), get: eventTarget },
+    DROP_ALARM_WF: { ...recorder(workflows.alarm), get: eventTarget(workflows.alarmEvents) },
     PRICE_WATCH_WF: recorder(workflows.watch),
     KV: rt.kv,
     GOOGLE_CLIENT_ID: 'client-id.apps.test',
