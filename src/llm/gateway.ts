@@ -1,8 +1,11 @@
 /**
  * src/llm/gateway.ts — the metered model router. Every LLM call in the app goes through callLlm().
  *
- * Routing (CLAUDE.md §0):  chief  -> gpt-6-sol,  failover claude-opus-5-5
- *                          worker -> gpt-6-luna, failover claude-haiku-5-5
+ * Routing (CLAUDE.md §0):  chief  -> gpt-6.2-sol (env.CHIEF_MODEL),  failover claude-opus-5-5
+ *                          worker -> gpt-6-luna   (env.WORKER_MODEL), failover claude-haiku-5-5
+ * An override must be a model in src/llm/pricing.ts (every call is metered); anything else throws UnknownModelError
+ * before any request, and a primary that answers 404 (model not found) is recorded as 'llm_model_not_found' in audit_log
+ * so a misconfigured id can never hide behind the failover.
  * Failover happens on ANY failure of the primary (network error, timeout, non-2xx, refusal, truncated or empty output).
  *
  * Guardrails, all deterministic and all enforced BEFORE any network call:
@@ -20,7 +23,7 @@
 import { redact } from '../redact';
 import { createGuardedFetch } from '../net/egress';
 import type { Env } from '../types';
-import { costUsd, type LlmModel } from './pricing';
+import { LLM_MODELS, costUsd, type LlmModel } from './pricing';
 
 export const WORKER_INPUT_TOKEN_CEILING = 90_000;
 /** Luna / Haiku price cliff: prompts above this are billed at a multiple of the normal rate. */
@@ -28,9 +31,13 @@ export const PRICE_CLIFF_TOKENS = 100_000;
 
 export type LlmRole = 'chief' | 'worker';
 
+export const DEFAULT_CHIEF_MODEL: LlmModel = 'gpt-6.2-sol';
+export const DEFAULT_WORKER_MODEL: LlmModel = 'gpt-6-luna';
+
+/** Default routes (no overrides). */
 export const MODEL_ROUTES: Readonly<Record<LlmRole, { primary: LlmModel; failover: LlmModel }>> = {
-  chief: { primary: 'gpt-6-sol', failover: 'claude-opus-5-5' },
-  worker: { primary: 'gpt-6-luna', failover: 'claude-haiku-5-5' },
+  chief: { primary: DEFAULT_CHIEF_MODEL, failover: 'claude-opus-5-5' },
+  worker: { primary: DEFAULT_WORKER_MODEL, failover: 'claude-haiku-5-5' },
 };
 
 const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
@@ -41,6 +48,21 @@ const DEFAULT_TIMEOUT_MS = 90_000;
 const PROMPT_OVERHEAD_TOKENS = 64;
 
 // ─── errors ─────────────────────────────────────────────────────────────────
+
+export class UnknownModelError extends Error {
+  override readonly name = 'UnknownModelError';
+  constructor(readonly role: LlmRole, readonly model: string) {
+    super(`${role} model '${model}' has no entry in src/llm/pricing.ts (known: ${LLM_MODELS.join(', ')})`);
+  }
+}
+
+/** Resolves the primary/failover pair for a role, applying CHIEF_MODEL / WORKER_MODEL overrides. */
+export function resolveRoute(role: LlmRole, overrides?: { chief?: string | undefined; worker?: string | undefined }): { primary: LlmModel; failover: LlmModel } {
+  const wanted = overrides?.[role];
+  if (wanted === undefined || wanted === '') return MODEL_ROUTES[role];
+  if (!(LLM_MODELS as readonly string[]).includes(wanted)) throw new UnknownModelError(role, wanted);
+  return { primary: wanted as LlmModel, failover: MODEL_ROUTES[role].failover };
+}
 
 export class TokenCliffError extends Error {
   override readonly name = 'TokenCliffError';
@@ -113,6 +135,8 @@ export interface GatewayDeps {
   /** Token estimator for the pre-flight ceiling. Default: estimateTokens. */
   countTokens?: (text: string) => number;
   timeoutMs?: number;
+  /** Optional model overrides (env.CHIEF_MODEL / env.WORKER_MODEL). */
+  models?: { chief?: string | undefined; worker?: string | undefined };
 }
 
 export interface Gateway {
@@ -346,7 +370,7 @@ export async function callLlm(deps: GatewayDeps, role: LlmRole, req: LlmRequest)
     throw new TokenCliffError(estimated, WORKER_INPUT_TOKEN_CEILING, req.purpose);
   }
 
-  const route = MODEL_ROUTES[role];
+  const route = resolveRoute(role, deps.models);
   const maxOut = req.max_output_tokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
   const attempts: FailedAttempt[] = [];
 
@@ -360,6 +384,9 @@ export async function callLlm(deps: GatewayDeps, role: LlmRole, req: LlmRequest)
       // Egress policy violations are programming errors, not outages: never fail over around them.
       if (err instanceof Error && err.name === 'PolicyBlockedError') throw err;
       await audit(deps, req.household_id, 'llm_attempt_failed', { role, model, purpose: req.purpose, error: message.slice(0, 400) });
+      if (model === route.primary && /^HTTP 404\b/.test(message)) {
+        await audit(deps, req.household_id, 'llm_model_not_found', { role, model, purpose: req.purpose });
+      }
       continue;
     }
     const cost = costUsd(model, out);
@@ -410,10 +437,11 @@ export function createGateway(deps: GatewayDeps): Gateway {
 }
 
 /** Production wiring: keys from secrets, network through the policy-guarded fetch. */
-export function gatewayFromEnv(env: Pick<Env, 'DB' | 'OPENAI_API_KEY' | 'ANTHROPIC_API_KEY'>): Gateway {
+export function gatewayFromEnv(env: Pick<Env, 'DB' | 'OPENAI_API_KEY' | 'ANTHROPIC_API_KEY' | 'CHIEF_MODEL' | 'WORKER_MODEL'>): Gateway {
   return createGateway({
     db: env.DB,
     apiKeys: { openai: env.OPENAI_API_KEY, anthropic: env.ANTHROPIC_API_KEY },
     fetch: createGuardedFetch({ db: env.DB }),
+    models: { chief: env.CHIEF_MODEL, worker: env.WORKER_MODEL },
   });
 }

@@ -35,10 +35,21 @@ export interface Env {
   /** Cloudflare Workflows bindings (wrangler.toml [[workflows]]). */
   INGEST_EMAIL_WF: Workflow<IngestEmailParams>;
   INGEST_FILE_WF: Workflow<IngestFileParams>;
+  CALENDAR_SYNC_WF: Workflow<CalendarSyncParams>;
+  NIGHTLY_SWEEP_WF: Workflow<NightlySweepParams>;
+  /** Encrypted OAuth tokens (wrangler.toml [[kv_namespaces]]). Values are AES-GCM under the household DEK. */
+  KV: KVNamespace;
   /** Secrets (`wrangler secret put`): 32-byte base64 key-encryption key, and the two LLM provider keys. */
   KEK_B64: string;
+  /** Google OAuth client (calendar.events.readonly + calendar.freebusy only) and the HMAC key for API session tokens. */
+  GOOGLE_CLIENT_ID: string;
+  GOOGLE_CLIENT_SECRET: string;
+  SESSION_SECRET: string;
   OPENAI_API_KEY: string;
   ANTHROPIC_API_KEY: string;
+  /** Optional model overrides; must be ids listed in src/llm/pricing.ts. Defaults: gpt-6.2-sol (chief), gpt-6-luna (worker). */
+  CHIEF_MODEL?: string;
+  WORKER_MODEL?: string;
 }
 
 /** Payload of an IngestEmailWF instance. The raw MIME is already encrypted in R2 at `r2_key`. */
@@ -50,6 +61,18 @@ export interface IngestEmailParams {
   size_bytes: number;
   /** SMTP envelope sender (lower-cased). */
   envelope_from: string;
+}
+
+/** Payload of a CalendarSyncWF instance. When `then_sweep` is set the workflow starts NightlySweepWF when it finishes. */
+export interface CalendarSyncParams {
+  household_id: string;
+  then_sweep: boolean;
+}
+
+/** Payload of a NightlySweepWF instance. `as_of` (ISO) overrides the clock; used by tests and replays. */
+export interface NightlySweepParams {
+  household_id: string;
+  as_of?: IsoTimestamp;
 }
 
 export type SignConvention = 'negative_is_outflow' | 'positive_is_outflow' | 'auto';

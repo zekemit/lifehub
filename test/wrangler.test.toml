@@ -12,3 +12,6 @@ migrations_dir = "../migrations"
 [[r2_buckets]]
 binding = "DOCS_BUCKET"
 bucket_name = "lifehub-docs"
+
+[[kv_namespaces]]
+binding = "KV"

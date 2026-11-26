@@ -512,7 +512,7 @@ export function periodsFor(
   return out;
 }
 
-/** Descriptor tokens of a catalog row; 'category:' tokens cannot be matched against descriptors and are dropped. */
+/** Descriptor tokens of a catalog row (upper case). 'category:' tokens are returned by categoryTokens(). */
 export function descriptorTokens(merchantMatch: string): string[] {
   return merchantMatch
     .split('|')
@@ -520,14 +520,32 @@ export function descriptorTokens(merchantMatch: string): string[] {
     .filter((t) => t !== '' && !t.startsWith('CATEGORY:'));
 }
 
+/** Category names of a catalog row's 'category:<name>' tokens (lower case). */
+export function categoryTokens(merchantMatch: string): string[] {
+  return merchantMatch
+    .split('|')
+    .map((t) => t.trim().toLowerCase())
+    .filter((t) => t.startsWith('category:') && t.length > 'category:'.length)
+    .map((t) => t.slice('category:'.length));
+}
+
+/** A transaction's envelope matches a category token when it is that category or a sub-category ('travel' ~ 'travel_and_vacation'). */
+export function envelopeMatchesCategory(envelopeKey: string | null, categories: readonly string[]): boolean {
+  return envelopeKey !== null && categories.some((c) => envelopeKey === c || envelopeKey.startsWith(`${c}_`));
+}
+
 /**
  * Recomputes credit_periods for every card whose product is in benefit_catalog, over the periods that overlap
  * [rangeFrom, rangeTo] and the current period. used_cents = min(benefit amount, matching outflows in the period), taken
  * from the transactions table, so running it twice (or re-importing a file) yields identical rows.
  *
+ * A transaction counts toward a benefit when its descriptor contains one of the catalog's descriptor tokens, or when its
+ * envelope matches one of its 'category:<name>' tokens (exact, or a sub-category such as travel_and_vacation).
+ *
  * A period is only reported unused ('open' while running, 'expired_unused' once over) when the card's transactions
- * actually cover it; otherwise no row is written, because "unused" would be a claim the data cannot support.
- * Benefits that can only be matched by issuer category have no measurable spend and are skipped.
+ * cover it from its first day. A CURRENT period the card has no history for yet (a card just added, or data that starts
+ * mid-period) is written as 'unconfirmed': we cannot say whether the credit was used. Finished periods without
+ * coverage are not written at all.
  */
 export async function recomputeCreditPeriods(
   db: D1Database,
@@ -557,13 +575,13 @@ export async function recomputeCreditPeriods(
   const upserts: Array<Array<string | number | null>> = [];
 
   for (const card of cards) {
-    const benefits = catalog.filter((b) => b.card_product === card.value_text && descriptorTokens(b.merchant_match).length > 0);
+    const benefits = catalog.filter((b) => b.card_product === card.value_text);
     if (benefits.length === 0) continue;
-    const coverage = await db
+    const found = await db
       .prepare('SELECT MIN(posted_on) AS lo, MAX(posted_on) AS hi FROM transactions WHERE household_id = ? AND card_entity_id = ?')
       .bind(household_id, card.subject_id)
       .first<{ lo: string | null; hi: string | null }>();
-    if (coverage === null || coverage.lo === null || coverage.hi === null) continue;
+    const coverage = found !== null && found.lo !== null && found.hi !== null ? { lo: found.lo, hi: found.hi } : null;
 
     const planned = benefits.flatMap((b) =>
       periodsFor(b.cadence, from, to, anniversaryOf.get(card.subject_id) ?? null)
@@ -574,31 +592,41 @@ export async function recomputeCreditPeriods(
     const loadFrom = planned.reduce((lo, p) => (p.period.start < lo ? p.period.start : lo), planned[0]!.period.start);
     const loadTo = planned.reduce((hi, p) => (p.period.end > hi ? p.period.end : hi), planned[0]!.period.end);
 
-    const spend: Array<{ posted_on: string; cents: number; descriptor: string }> = [];
-    for (let offset = 0; ; offset += 500) {
+    const spend: Array<{ posted_on: string; cents: number; descriptor: string; envelope: string | null }> = [];
+    for (let offset = 0; coverage !== null; offset += 500) {
       const { results } = await db
         .prepare(
-          `SELECT posted_on, amount_cents, descriptor_norm FROM transactions
+          `SELECT posted_on, amount_cents, descriptor_norm, envelope_key FROM transactions
             WHERE household_id = ? AND card_entity_id = ? AND amount_cents < 0 AND posted_on BETWEEN ? AND ?
             ORDER BY posted_on, txn_id LIMIT 500 OFFSET ?`,
         )
         .bind(household_id, card.subject_id, loadFrom, loadTo, offset)
-        .all<{ posted_on: string; amount_cents: number; descriptor_norm: string }>();
-      spend.push(...results.map((r) => ({ posted_on: r.posted_on, cents: -r.amount_cents, descriptor: r.descriptor_norm })));
+        .all<{ posted_on: string; amount_cents: number; descriptor_norm: string; envelope_key: string | null }>();
+      spend.push(...results.map((r) => ({ posted_on: r.posted_on, cents: -r.amount_cents, descriptor: r.descriptor_norm, envelope: r.envelope_key })));
       if (results.length < 500) break;
     }
 
     for (const { benefit, period } of planned) {
       const tokens = descriptorTokens(benefit.merchant_match);
+      const categories = categoryTokens(benefit.merchant_match);
       const matched = spend
-        .filter((s) => s.posted_on >= period.start && s.posted_on <= period.end && tokens.some((t) => s.descriptor.includes(t)))
+        .filter(
+          (s) =>
+            s.posted_on >= period.start &&
+            s.posted_on <= period.end &&
+            (tokens.some((t) => s.descriptor.includes(t)) || envelopeMatchesCategory(s.envelope, categories)),
+        )
         .reduce((sum, s) => sum + s.cents, 0);
       const used = Math.min(matched, benefit.amount_cents);
+      const covered = coverage !== null && coverage.lo <= period.start;
       let status: string;
       if (used >= benefit.amount_cents) status = 'used';
       else if (used > 0) status = 'partially_used';
-      else if (period.end >= today) status = 'open';
-      else if (coverage.lo <= period.start && daysBetween(coverage.hi, period.end) <= 7) status = 'expired_unused';
+      else if (!covered) {
+        if (period.end < today) continue;
+        status = 'unconfirmed';
+      } else if (period.end >= today) status = 'open';
+      else if (coverage !== null && daysBetween(coverage.hi, period.end) <= 7) status = 'expired_unused';
       else continue;
       upserts.push([household_id, card.subject_id, benefit.benefit_key, period.start, period.end, used, status]);
     }
@@ -609,8 +637,7 @@ export async function recomputeCreditPeriods(
     `(?, ?, ?, ?, ?, ?, ?)`,
     upserts,
     `ON CONFLICT (household_id, card_entity_id, benefit_key, period_start) DO UPDATE SET
-       period_end = excluded.period_end, used_cents = excluded.used_cents, status = excluded.status
-     WHERE credit_periods.status <> 'unconfirmed'`,
+       period_end = excluded.period_end, used_cents = excluded.used_cents, status = excluded.status`,
   );
   if (statements.length > 0) await db.batch(statements);
   return { updated: upserts.length };
@@ -642,6 +669,13 @@ export interface HistoryTxn {
   episode_id: string;
 }
 
+/** A stretch of the series charged at one exact amount. */
+export interface AmountSegment {
+  amount_cents: number;
+  /** First charge at this amount. */
+  first: HistoryTxn;
+}
+
 export interface RecurringSeries {
   key: string;
   merchant_entity_id: string | null;
@@ -653,6 +687,8 @@ export interface RecurringSeries {
   valid_from: string;
   occurrences: number;
   latest: HistoryTxn;
+  /** Up to the 4 most recent amount segments, oldest first; the last one is the current price. */
+  segments: AmountSegment[];
 }
 
 function baseOf(descriptorNorm: string): string {
@@ -696,6 +732,13 @@ export function detectRecurring(history: readonly HistoryTxn[]): RecurringSeries
     const latest = sorted[best.end]!;
     let first = best.end;
     while (first > best.start && sorted[first - 1]!.amount_cents === latest.amount_cents) first -= 1;
+    const segments: AmountSegment[] = [];
+    for (let i = best.start; i <= best.end; i++) {
+      const t = sorted[i]!;
+      if (segments.length === 0 || segments[segments.length - 1]!.amount_cents !== Math.abs(t.amount_cents)) {
+        segments.push({ amount_cents: Math.abs(t.amount_cents), first: t });
+      }
+    }
     series.push({
       key,
       merchant_entity_id: latest.merchant_entity_id,
@@ -705,6 +748,7 @@ export function detectRecurring(history: readonly HistoryTxn[]): RecurringSeries
       valid_from: sorted[first]!.posted_on,
       occurrences: best.end - best.start + 1,
       latest,
+      segments: segments.slice(-4),
     });
   }
   return series.sort((a, b) => a.key.localeCompare(b.key));
@@ -744,37 +788,58 @@ function titleCase(s: string): string {
   return s.toLowerCase().replace(/\b[a-z]/g, (c) => c.toUpperCase());
 }
 
-/** Turns a detected series into graph proposals (amount, cadence, merchant, card), grounded on the latest charge's line. */
+/**
+ * Turns a detected series into graph proposals. Every price segment is written, each grounded on the line of its first
+ * charge: older segments are CLOSED at the next segment's first charge (valid_to), the current one stays open. Writing the
+ * history this way is what lets T_SUBSCRIPTION_CREEP see "old price -> new price" from a single file, and it keeps a
+ * re-import idempotent (a bounded older segment never conflicts with the open current one). Cadence, merchant and card are
+ * written once, for the current segment. Segments whose line is not in this file are skipped: they were written earlier.
+ */
 export function seriesToProposals(
   series: RecurringSeries,
   input: {
     household_id: string;
-    episode_id: string;
+    episode_id: (txn: HistoryTxn) => string | null;
     merchantName: string | null;
-    quote: { quote: string; char_start: number; char_end: number };
+    quoteFor: (txn: HistoryTxn) => { quote: string; char_start: number; char_end: number } | null;
   },
 ): FactProposal[] {
   const name = input.merchantName ?? titleCase(series.descriptor_base);
   const subject = { type: 'recurring_charge', name } as const;
-  const common = {
-    household_id: input.household_id,
-    source_episode_id: input.episode_id,
-    subject,
-    valid_from: series.valid_from,
-    confidence: 0.9,
-    quotes: [input.quote],
+  const proposals: FactProposal[] = [];
+  const base = (txn: HistoryTxn): Pick<FactProposal, 'household_id' | 'source_episode_id' | 'subject' | 'confidence' | 'quotes'> | null => {
+    const quote = input.quoteFor(txn);
+    const episode = input.episode_id(txn);
+    return quote === null || episode === null ? null : { household_id: input.household_id, source_episode_id: episode, subject, confidence: 0.9, quotes: [quote] };
   };
-  const proposals: FactProposal[] = [
-    { ...common, predicate: 'recurring_amount', value_cents: series.amount_cents, currency: 'USD' },
-    { ...common, predicate: 'recurring_cadence', value_text: series.cadence },
-    {
+  for (const [i, segment] of series.segments.entries()) {
+    const common = base(segment.first);
+    if (common === null) continue;
+    const next = series.segments[i + 1];
+    proposals.push({
       ...common,
-      predicate: 'recurring_merchant',
-      object: series.merchant_entity_id === null ? { type: 'merchant', name } : { entity_id: series.merchant_entity_id },
-    },
-  ];
-  if (series.latest.card_entity_id !== null) {
-    proposals.push({ ...common, predicate: 'charged_to_card', object: { entity_id: series.latest.card_entity_id } });
+      predicate: 'recurring_amount',
+      value_cents: segment.amount_cents,
+      currency: 'USD',
+      valid_from: segment.first.posted_on,
+      ...(next === undefined ? {} : { valid_to: next.first.posted_on }),
+    });
+  }
+  const current = series.segments[series.segments.length - 1];
+  const common = current === undefined ? null : base(current.first);
+  if (common !== null) {
+    const withFrom = { ...common, valid_from: series.valid_from };
+    proposals.push(
+      { ...withFrom, predicate: 'recurring_cadence', value_text: series.cadence },
+      {
+        ...withFrom,
+        predicate: 'recurring_merchant',
+        object: series.merchant_entity_id === null ? { type: 'merchant', name } : { entity_id: series.merchant_entity_id },
+      },
+    );
+    if (series.latest.card_entity_id !== null) {
+      proposals.push({ ...withFrom, predicate: 'charged_to_card', object: { entity_id: series.latest.card_entity_id } });
+    }
   }
   return proposals;
 }

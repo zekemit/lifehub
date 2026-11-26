@@ -7,10 +7,12 @@ compatibility_flags = ["nodejs_compat"]
 enabled = true
 
 # Non-secret configuration. Source code reads these from `env`; it never hardcodes the brand or the domain.
-# Secrets (KEK_B64, OPENAI_API_KEY, ANTHROPIC_API_KEY) are set with `wrangler secret put`, never here.
+# Secrets (KEK_B64, SESSION_SECRET, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, OPENAI_API_KEY, ANTHROPIC_API_KEY) are set
+# with `wrangler secret put`, never here. Optional overrides CHIEF_MODEL / WORKER_MODEL (ids from src/llm/pricing.ts) may be
+# added to [vars]; the defaults are gpt-6.2-sol and gpt-6-luna.
 [vars]
-APP_NAME = "Keel"
-INBOUND_DOMAIN = "in.lifehub.app"
+APP_NAME = "Hayes"
+INBOUND_DOMAIN = "in.askhayes.com"
 
 # Durable ingestion pipelines (classes are exported from src/index.ts).
 [[workflows]]
@@ -22,6 +24,24 @@ class_name = "IngestEmailWF"
 name = "ingest-file"
 binding = "INGEST_FILE_WF"
 class_name = "IngestFileWF"
+
+[[workflows]]
+name = "calendar-sync"
+binding = "CALENDAR_SYNC_WF"
+class_name = "CalendarSyncWF"
+
+[[workflows]]
+name = "nightly-sweep"
+binding = "NIGHTLY_SWEEP_WF"
+class_name = "NightlySweepWF"
+
+# Hourly. src/workers/scheduled.ts starts the nightly chain only for households whose local time is 03:00.
+[triggers]
+crons = ["0 * * * *"]
+
+# Encrypted OAuth tokens. The namespace id is omitted: `wrangler deploy` provisions it.
+[[kv_namespaces]]
+binding = "KV"
 
 # Control + tenancy DB. Shard DBs (shard_00..03) are added as extra [[d1_databases]] bindings
 # when the repository layer lands; writeFact() already takes the target D1Database as an argument.

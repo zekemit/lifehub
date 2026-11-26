@@ -274,17 +274,24 @@ export async function runIngestFile(
       series.flatMap((s) => (s.merchant_entity_id === null ? [] : [s.merchant_entity_id])),
     );
     const out: FactProposal[] = [];
+    const sliceOf = (row: ParsedTxn): EpisodeSlice | undefined => prepared.episodes.find((e) => row.index >= e.row_from && row.index < e.row_to);
     for (const s of series) {
-      const row = rowByTxn.get(s.latest.txn_id)!;
-      const slice = prepared.episodes.find((e) => row.index >= e.row_from && row.index < e.row_to)!;
-      const start = row.start - slice.start;
-      const end = Math.min(row.end - slice.start, start + 1000);
       out.push(
         ...seriesToProposals(s, {
           household_id: params.household_id,
-          episode_id: slice.episode_id,
           merchantName: s.merchant_entity_id === null ? null : (names.get(s.merchant_entity_id) ?? null),
-          quote: { quote: text.slice(slice.start + start, slice.start + end), char_start: start, char_end: end },
+          episode_id: (txn) => {
+            const row = rowByTxn.get(txn.txn_id);
+            return row === undefined ? null : (sliceOf(row)?.episode_id ?? null);
+          },
+          quoteFor: (txn) => {
+            const row = rowByTxn.get(txn.txn_id);
+            const slice = row === undefined ? undefined : sliceOf(row);
+            if (row === undefined || slice === undefined) return null;
+            const start = row.start - slice.start;
+            const end = Math.min(row.end - slice.start, start + 1000);
+            return { quote: text.slice(slice.start + start, slice.start + end), char_start: start, char_end: end };
+          },
         }),
       );
     }

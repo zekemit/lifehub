@@ -11,6 +11,7 @@ import { resolve } from 'node:path';
 export interface TestRuntime {
   db: D1Database;
   bucket: R2Bucket;
+  kv: KVNamespace;
   dispose(): Promise<void>;
 }
 
@@ -18,13 +19,13 @@ export async function openTestRuntime(): Promise<TestRuntime> {
   const root = process.env['PROJECT_ROOT'] ?? process.cwd();
   const require = createRequire(resolve(root, 'package.json'));
   const { getPlatformProxy } = require('wrangler') as {
-    getPlatformProxy: (o: unknown) => Promise<{ env: { DB: D1Database; DOCS_BUCKET: R2Bucket }; dispose(): Promise<void> }>;
+    getPlatformProxy: (o: unknown) => Promise<{ env: { DB: D1Database; DOCS_BUCKET: R2Bucket; KV: KVNamespace }; dispose(): Promise<void> }>;
   };
   const proxy = await getPlatformProxy({
     configPath: resolve(root, 'test/wrangler.test.toml'),
     persist: { path: process.env['STATE_DIR'] },
   });
-  return { db: proxy.env.DB, bucket: proxy.env.DOCS_BUCKET, dispose: proxy.dispose };
+  return { db: proxy.env.DB, bucket: proxy.env.DOCS_BUCKET, kv: proxy.env.KV, dispose: proxy.dispose };
 }
 
 // ── query counting (D1 allows 1,000 queries per invocation; every statement of a batch counts) ──

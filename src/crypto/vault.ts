@@ -80,6 +80,38 @@ async function householdDek(env: KekEnv, household_id: string, create: boolean):
   return importAesKey(dek, ['encrypt', 'decrypt']);
 }
 
+/**
+ * Encrypts small secrets (OAuth tokens in KV) under the household DEK. `aad` must name the household and the place the
+ * ciphertext is stored, e.g. `kv:<household_id>:<key>`; decryption fails if it does not match.
+ */
+export async function encryptForHousehold(
+  env: KekEnv,
+  household_id: string,
+  aad: string,
+  plaintext: Uint8Array,
+): Promise<Uint8Array> {
+  return sealWith(await householdDek(env, household_id, true), aad, plaintext);
+}
+
+export async function decryptForHousehold(
+  env: KekEnv,
+  household_id: string,
+  aad: string,
+  blob: Uint8Array,
+): Promise<Uint8Array> {
+  return openWith(await householdDek(env, household_id, false), aad, blob);
+}
+
+export function toBase64(bytes: Uint8Array): string {
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+export function fromBase64Bytes(b64: string): Uint8Array {
+  return fromBase64(b64);
+}
+
 /** Encrypts `plaintext` and stores it at `r2_key`. Returns the stored size in bytes. */
 export async function putEncrypted(
   env: KekEnv,
