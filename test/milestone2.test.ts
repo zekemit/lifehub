@@ -177,21 +177,21 @@ function sourceFiles(dir: string): string[] {
   });
 }
 
-test('EGRESS: no source file calls the global fetch() except the guarded wrapper', () => {
+test('EGRESS: no source file calls the global fetch() except the guarded wrapper (a `fetch` handler declaration is not a call)', () => {
   const root = resolve(process.env['PROJECT_ROOT'] ?? process.cwd(), 'src');
   const offenders = sourceFiles(root)
     .filter((f) => !f.endsWith(join('net', 'egress.ts')))
-    .filter((f) => /(^|[^.\w$])fetch\s*\(/.test(readFileSync(f, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')));
+    .filter((f) => /(?<!async\s)(?<![.\w$])fetch\s*\(/.test(readFileSync(f, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')));
   assert.deepEqual(offenders, []);
 });
 
 test('CONFIG: no brand name or domain is hardcoded in source (they come from env vars)', () => {
   const root = resolve(process.env['PROJECT_ROOT'] ?? process.cwd());
-  const hits = sourceFiles(join(root, 'src')).filter((f) => /lifehub\.app|\bKeel\b/i.test(readFileSync(f, 'utf8')));
+  const hits = sourceFiles(join(root, 'src')).filter((f) => /askhayes\.com|\bHayes\b/i.test(readFileSync(f, 'utf8')));
   assert.deepEqual(hits, []);
   const toml = readFileSync(join(root, 'wrangler.toml'), 'utf8');
-  assert.match(toml, /APP_NAME = "Keel"/);
-  assert.match(toml, /INBOUND_DOMAIN = "in\.lifehub\.app"/);
+  assert.match(toml, /APP_NAME = "Hayes"/);
+  assert.match(toml, /INBOUND_DOMAIN = "in\.askhayes\.com"/);
   assert.match(toml, /binding = "INGEST_EMAIL_WF"[\s\S]*class_name = "IngestEmailWF"/);
   assert.match(toml, /binding = "INGEST_FILE_WF"[\s\S]*class_name = "IngestFileWF"/);
 });
@@ -200,21 +200,21 @@ test('CONFIG: no brand name or domain is hardcoded in source (they come from env
 
 const SCHEMA = { name: 'echo', schema: { type: 'object', additionalProperties: false, required: ['ok'], properties: { ok: { type: 'boolean' } } } };
 
-test('GATEWAY: routes chief -> gpt-6-sol and worker -> gpt-6-luna, and meters every call into llm_usage', async () => {
+test('GATEWAY: routes chief -> gpt-6.2-sol and worker -> gpt-6-luna, and meters every call into llm_usage', async () => {
   const h = await makeHousehold(db);
   const { gateway, calls } = gatewayWith(() => openaiReply({ ok: true }, { prompt_tokens: 2000, completion_tokens: 500, cached: 400 }));
   assert.deepEqual(MODEL_ROUTES, {
-    chief: { primary: 'gpt-6-sol', failover: 'claude-opus-5-5' },
+    chief: { primary: 'gpt-6.2-sol', failover: 'claude-opus-5-5' },
     worker: { primary: 'gpt-6-luna', failover: 'claude-haiku-5-5' },
   });
   const w = await gateway.worker({ household_id: h.household_id, purpose: 't.worker', system: 'You are a test.', user: 'hello', json_schema: SCHEMA });
   const c = await gateway.chief({ household_id: h.household_id, purpose: 't.chief', system: 'You are a test.', user: 'hello' });
   assert.equal(calls[0]!.host, 'api.openai.com');
   assert.equal(calls[0]!.body['model'], 'gpt-6-luna');
-  assert.equal(calls[1]!.body['model'], 'gpt-6-sol');
+  assert.equal(calls[1]!.body['model'], 'gpt-6.2-sol');
   assert.deepEqual((calls[0]!.body['response_format'] as { json_schema: { strict: boolean } }).json_schema.strict, true);
   assert.equal(w.failed_over, false);
-  assert.equal(c.model, 'gpt-6-sol');
+  assert.equal(c.model, 'gpt-6.2-sol');
   const rows = await llmRows(h.household_id);
   assert.equal(rows.length, 2);
   assert.deepEqual(rows[0] && { m: rows[0].model, i: rows[0].input_tokens, c: rows[0].cached_tokens, o: rows[0].output_tokens }, { m: 'gpt-6-luna', i: 2000, c: 400, o: 500 });
@@ -335,7 +335,7 @@ test('GATEWAY: raw SSNs, card numbers and credentials never leave the Worker (Un
 });
 
 test('PRICING: costs follow the published tables, including the Haiku 100K cliff', () => {
-  assert.deepEqual(Object.keys(MODEL_PRICING).sort(), ['claude-haiku-5-5', 'claude-opus-5-5', 'gpt-6-luna', 'gpt-6-sol']);
+  assert.deepEqual(Object.keys(MODEL_PRICING).sort(), ['claude-haiku-5-5', 'claude-opus-5-5', 'gpt-6-luna', 'gpt-6.1-sol', 'gpt-6.2-sol']);
   close(costUsd('claude-haiku-5-5', { input_tokens: 100_000, cached_tokens: 0, output_tokens: 0 }), 0.01);
   close(costUsd('claude-haiku-5-5', { input_tokens: 100_001, cached_tokens: 0, output_tokens: 0 }), 100_001 * 0.5 / 1e6);
   close(costUsd('claude-opus-5-5', { input_tokens: 1_000_000, cached_tokens: 0, output_tokens: 1_000_000 }), 24);
@@ -385,7 +385,7 @@ test('VAULT: concurrent first writes for a new household converge on a single da
 
 test('EMAIL: recipient parsing and Authentication-Results trust', () => {
   assert.equal(parseRecipient('H_abcdefgh23@Inbound.Test', 'inbound.test'), 'h_abcdefgh23');
-  assert.equal(parseRecipient('h_abcdefgh23@in.lifehub.app', 'inbound.test'), null);
+  assert.equal(parseRecipient('h_abcdefgh23@in.askhayes.com', 'inbound.test'), null);
   for (const bad of ['h_short@inbound.test', 'x_abcdefgh23@inbound.test', 'h_abcdefgh2!@inbound.test', 'h_abcdefgh18@inbound.test', 'nope', '@inbound.test']) {
     assert.equal(parseRecipient(bad, 'inbound.test'), null, bad);
   }
@@ -405,7 +405,7 @@ test('EMAIL: unknown or malformed recipients are rejected with setReject()', asy
   const { env, workflows } = testEnv(rt);
   const h = await makeHousehold(db);
   const body = rfc822({ to: 'x', subject: 's', body: 'b', authResults: PASSING_AUTH });
-  for (const to of ['h_aaaaaaaaaa@inbound.test', `${h.alias_local}@in.lifehub.app`, 'whoever@inbound.test', 'h_bad@inbound.test']) {
+  for (const to of ['h_aaaaaaaaaa@inbound.test', `${h.alias_local}@in.askhayes.com`, 'whoever@inbound.test', 'h_bad@inbound.test']) {
     const msg = inboundMessage(body, { from: 'a@example.com', to });
     const out = await handleEmail(msg, env);
     assert.equal(out.status, 'rejected', to);
@@ -428,7 +428,7 @@ test('EMAIL: 25 MiB cap (declared and actual size), message names the product fr
   assert.equal(out.status, 'rejected');
   assert.match(declared.rejected!, /25 MiB/);
   assert.match(declared.rejected!, /TestApp/);
-  assert.doesNotMatch(declared.rejected!, /Keel/);
+  assert.doesNotMatch(declared.rejected!, /Hayes/);
   const big = new Uint8Array(MAX_EMAIL_BYTES + 10).fill(65);
   const lying = inboundMessage(big, { from: 'a@example.com', to: `${h.alias_local}@inbound.test`, rawSize: 100 });
   assert.equal((await handleEmail(lying, env)).status, 'rejected');
@@ -922,7 +922,8 @@ test('SPEND: a Resy charge on an Amex Platinum increments credit_periods.used_ce
   assert.equal(before.result.status, 'done');
   const headroom = async () => (await one<{ headroom_cents: number }>(`SELECT headroom_cents FROM envelope_headroom WHERE household_id = ? AND envelope_key = 'restaurants_and_bar'`, h.household_id)).headroom_cents;
   assert.equal(await headroom(), 50000, 'median(400, 500, 600) = 500.00 and nothing spent yet this month');
-  assert.equal(await count('SELECT 1 FROM credit_periods WHERE household_id = ?', h.household_id), 0, 'no Amex spend yet, so no period is reported');
+  const unseen = await all<{ status: string; used_cents: number }>('SELECT status, used_cents FROM credit_periods WHERE household_id = ?', h.household_id);
+  assert.ok(unseen.length > 0 && unseen.every((p) => p.status === 'unconfirmed' && p.used_cents === 0), 'no Amex history yet: current periods are unconfirmed, never "open"');
   const resy = mrow(on(0, 1), 'Resy', 'Restaurants & Bar', AMEX_ACCOUNT, 'RESY *L ARTUSI NEW YORK NY', '-112.40');
   await runFile(h, [MONARCH_HEADER, ...history, resy].join('\n') + '\n', NEVER);
   const period = await one<{ used_cents: number; status: string; period_start: string; period_end: string }>(

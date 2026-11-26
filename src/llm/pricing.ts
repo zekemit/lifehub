@@ -5,12 +5,12 @@
  *   Anthropic: https://platform.claude.com/docs/en/about-claude/pricing
  *   OpenAI:    https://platform.openai.com/docs/pricing
  *
- * Where a published row did not exist, the entry uses the closest published rate and says so in `basis`.
- * Both fallbacks are chosen so that metering OVER-states cost, never under-states it. Re-check this table when
+ * Where a published row did not exist, the entry uses the closest published rate and says so in `basis`
+ * (only gpt-6-luna, whose Standard row is not shown, is derived; the choice over-states cost, never under-states it). Re-check this table when
  * either vendor changes prices; `llm_usage.cost_usd` is computed from it at call time.
  */
 
-export const LLM_MODELS = ['gpt-6-sol', 'gpt-6-luna', 'claude-opus-5-5', 'claude-haiku-5-5'] as const;
+export const LLM_MODELS = ['gpt-6.2-sol', 'gpt-6.1-sol', 'gpt-6-luna', 'claude-opus-5-5', 'claude-haiku-5-5'] as const;
 export type LlmModel = (typeof LLM_MODELS)[number];
 
 export interface RateCard {
@@ -27,13 +27,17 @@ export interface ModelPrice extends RateCard {
 }
 
 export const MODEL_PRICING: Readonly<Record<LlmModel, ModelPrice>> = {
-  'gpt-6-sol': {
+  'gpt-6.2-sol': {
     input: 2,
     output: 10,
     cached_input: 0.1,
-    basis:
-      'OpenAI lists gpt-6.1-sol and gpt-6.2-sol at $2 / $10 / $0.10 (Standard). The page has no row with the literal id ' +
-      "'gpt-6-sol'; the Sol-tier rate is used.",
+    basis: 'OpenAI Standard rates for gpt-6.2-sol: $2.00 input / $10.00 output / $0.10 cached input (read 2026-11-26).',
+  },
+  'gpt-6.1-sol': {
+    input: 2,
+    output: 10,
+    cached_input: 0.1,
+    basis: 'OpenAI Standard rates for gpt-6.1-sol: $2.00 / $10.00 / $0.10 (read 2026-11-26). Selectable via CHIEF_MODEL.',
   },
   'gpt-6-luna': {
     input: 0.1,

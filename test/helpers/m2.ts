@@ -6,7 +6,7 @@
 import { randomUUID } from 'node:crypto';
 import type { InboundMessage } from '../../src/workers/emailRouter';
 import type { StepConfigLike, StepLike } from '../../src/ingest/steps';
-import type { Env, IngestEmailParams, IngestFileParams } from '../../src/types';
+import type { CalendarSyncParams, Env, IngestEmailParams, IngestFileParams, NightlySweepParams } from '../../src/types';
 import type { QueryCounter } from './index';
 
 // ── Workflow step (direct execution + accounting) ──
@@ -104,6 +104,8 @@ export async function makeHousehold(db: D1Database): Promise<Household> {
 export interface FakeWorkflows {
   email: Array<{ id: string; params: IngestEmailParams }>;
   file: Array<{ id: string; params: IngestFileParams }>;
+  calendar: Array<{ id: string; params: CalendarSyncParams }>;
+  sweep: Array<{ id: string; params: NightlySweepParams }>;
 }
 
 /** 32 random bytes, base64. */
@@ -118,8 +120,15 @@ const PROCESS_KEK = randomKek();
  * An Env for tests. APP_NAME and INBOUND_DOMAIN deliberately differ from wrangler.toml, so any code that hardcoded
  * the real brand or domain would visibly misbehave.
  */
-export function testEnv(rt: { db: D1Database; bucket: R2Bucket }): { env: Env; workflows: FakeWorkflows } {
-  const workflows: FakeWorkflows = { email: [], file: [] };
+export function testEnv(rt: { db: D1Database; bucket: R2Bucket; kv?: KVNamespace }): { env: Env; workflows: FakeWorkflows } {
+  const workflows: FakeWorkflows = { email: [], file: [], calendar: [], sweep: [] };
+  const recorder = <P>(list: Array<{ id: string; params: P }>) => ({
+    create: async (o: { id: string; params: P }) => {
+      if (list.some((w) => w.id === o.id)) throw new Error('instance already exists');
+      list.push(o);
+      return { id: o.id };
+    },
+  });
   const env = {
     DB: rt.db,
     DOCS_BUCKET: rt.bucket,
@@ -128,19 +137,14 @@ export function testEnv(rt: { db: D1Database; bucket: R2Bucket }): { env: Env; w
     KEK_B64: PROCESS_KEK,
     OPENAI_API_KEY: 'sk-test',
     ANTHROPIC_API_KEY: 'ak-test',
-    INGEST_EMAIL_WF: {
-      create: async (o: { id: string; params: IngestEmailParams }) => {
-        if (workflows.email.some((w) => w.id === o.id)) throw new Error('instance already exists');
-        workflows.email.push(o);
-        return { id: o.id };
-      },
-    },
-    INGEST_FILE_WF: {
-      create: async (o: { id: string; params: IngestFileParams }) => {
-        workflows.file.push(o);
-        return { id: o.id };
-      },
-    },
+    INGEST_EMAIL_WF: recorder(workflows.email),
+    INGEST_FILE_WF: recorder(workflows.file),
+    CALENDAR_SYNC_WF: recorder(workflows.calendar),
+    NIGHTLY_SWEEP_WF: recorder(workflows.sweep),
+    KV: rt.kv,
+    GOOGLE_CLIENT_ID: 'client-id.apps.test',
+    GOOGLE_CLIENT_SECRET: 'client-secret',
+    SESSION_SECRET: 'test-session-secret-0123456789',
   } as unknown as Env;
   return { env, workflows };
 }
