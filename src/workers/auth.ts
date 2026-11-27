@@ -18,6 +18,8 @@ import {
   CalendarAuthError, IdentityError, ScopeViolationError, buildAuthUrl, parseIdToken, requestTokens, storeConnector,
   type CalendarDeps,
 } from '../connectors/googleCalendar';
+import { GmailConsentError, buildGmailAuthUrl, requestGmailTokens } from '../connectors/gmailConsent';
+import { GmailScopeError, storeGmailConnector } from '../connectors/gmailSync';
 import type { Env } from '../types';
 import { trialGrantStatement } from '../billing/credits';
 import { error, json, newId } from './http';
@@ -39,6 +41,8 @@ export interface AuthDeps {
 }
 
 const CALLBACK_PATH = '/api/auth/google/callback';
+export const GMAIL_CONNECT_PATH = '/api/auth/google/gmail-connect';
+export const GMAIL_CALLBACK_PATH = '/api/auth/google/gmail-callback';
 const BASE32 = 'abcdefghijklmnopqrstuvwxyz234567';
 
 const randomB64url = (bytes: number): string => b64url(crypto.getRandomValues(new Uint8Array(bytes)));
@@ -238,4 +242,69 @@ export async function handleMe(env: Env, auth: Auth): Promise<Response> {
 
 export function handleLogout(): Response {
   return json(200, { status: 'signed_out' }, { 'set-cookie': clearCookieHeader(SESSION_COOKIE) });
+}
+
+// ─── Gmail consent (feature-flagged; restricted scope, Claude.md §0 and §9) ─────────────────────────────────────
+
+/** 403 CASA_PENDING unless ENABLE_GMAIL_OAUTH is exactly "true". Called before anything else, so no Google URL is ever built while it is off. */
+export function gmailOauthDisabled(env: Pick<Env, 'ENABLE_GMAIL_OAUTH'>): Response | null {
+  return env.ENABLE_GMAIL_OAUTH === 'true' ? null : json(403, { error: 'CASA_PENDING', message: 'Connecting Gmail is not available yet.' });
+}
+
+/** GET /api/auth/google/gmail-connect (signed in): 302 to Google for the Gmail read-only scope, PKCE S256. Which member and household is sealed in the cookie. */
+export async function handleGmailConnect(request: Request, env: Env, auth: Auth, deps: AuthDeps): Promise<Response> {
+  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) return error(503, 'not_configured', 'Google sign-in is not configured.');
+  const url = new URL(request.url);
+  const state = randomB64url(24);
+  const verifier = randomB64url(32);
+  const challenge = b64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))));
+  const sealed = await sealCookie(env.SESSION_SECRET, 'gmail_oauth', { state, verifier, household_id: auth.household_id, member_id: auth.member_id }, OAUTH_TTL_SECONDS, deps.now());
+  const location = buildGmailAuthUrl({ clientId: env.GOOGLE_CLIENT_ID, redirectUri: `${url.origin}${GMAIL_CALLBACK_PATH}`, state, codeChallenge: challenge });
+  return new Response(null, { status: 302, headers: { location, 'set-cookie': setCookieHeader(OAUTH_COOKIE, sealed, OAUTH_TTL_SECONDS), 'cache-control': 'no-store' } });
+}
+
+/**
+ * GET /api/auth/google/gmail-callback: public (Google redirects the browser here), authenticated by the sealed cookie the connect step set. It checks
+ * state, exchanges the code with the verifier, and has storeGmailConnector() refuse any grant but the Gmail read-only scope and keep the tokens
+ * AES-GCM-encrypted in KV. inbox_connections gets its row, so the setup endpoint and the first sync have somewhere to put the cursor.
+ */
+export async function handleGmailCallback(request: Request, env: Env, deps: AuthDeps): Promise<Response> {
+  const now = deps.now();
+  const clearOauth = { 'set-cookie': clearCookieHeader(OAUTH_COOKIE) };
+  const fail = (status: number, code: string, message: string): Response => error(status, code, message, clearOauth);
+  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) return fail(503, 'not_configured', 'Google sign-in is not configured.');
+  const url = new URL(request.url);
+  if (url.searchParams.get('error') !== null) return fail(400, 'oauth_denied', 'Connecting Gmail was cancelled or denied.');
+  const code = url.searchParams.get('code');
+  const state = url.searchParams.get('state');
+  if (code === null || state === null || code === '' || state === '') return fail(400, 'bad_request', 'Missing code or state.');
+  const rawCookie = readCookie(request, OAUTH_COOKIE);
+  const sealed = rawCookie === null ? null : await openCookie(env.SESSION_SECRET, 'gmail_oauth', rawCookie, now);
+  if (
+    sealed === null || typeof sealed['state'] !== 'string' || typeof sealed['verifier'] !== 'string' || typeof sealed['household_id'] !== 'string' ||
+    typeof sealed['member_id'] !== 'string' || !timingSafeEqual(sealed['state'], state)
+  ) {
+    return fail(400, 'bad_state', 'The attempt expired or did not start here. Try again.');
+  }
+  const { household_id, member_id } = sealed as { household_id: string; member_id: string };
+  const member = await env.DB.prepare(
+    `SELECT 1 AS ok FROM members m JOIN households h ON h.household_id = m.household_id WHERE m.member_id = ? AND m.household_id = ? AND h.deleted_at IS NULL`,
+  )
+    .bind(member_id, household_id)
+    .first<{ ok: number }>();
+  if (member === null) return fail(401, 'unauthorized', 'Sign in again.');
+
+  try {
+    const grant = await requestGmailTokens({ env, fetch: deps.fetch }, code, `${url.origin}${GMAIL_CALLBACK_PATH}`, sealed['verifier'] as string);
+    await storeGmailConnector({ env, fetch: deps.fetch, now: deps.now }, household_id, grant);
+  } catch (err) {
+    if (err instanceof GmailScopeError) return fail(403, 'scope_violation', 'Google granted a different access than this app asks for. Nothing was stored.');
+    if (err instanceof GmailConsentError) return fail(502, 'token_exchange_failed', 'Google did not accept the code.');
+    throw err;
+  }
+  await env.DB.prepare('INSERT OR IGNORE INTO inbox_connections (household_id) VALUES (?)').bind(household_id).run();
+  await audit(env.DB, household_id, 'gmail_connected', { member_id }, now);
+  const headers = new Headers({ location: '/?gmail=connected', 'cache-control': 'no-store' });
+  headers.append('set-cookie', clearCookieHeader(OAUTH_COOKIE));
+  return new Response(null, { status: 302, headers });
 }

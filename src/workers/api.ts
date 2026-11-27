@@ -11,6 +11,9 @@
  *   GET  /api/auth/me, POST /api/auth/logout
  *   POST /api/missions/<run_id>/(start|approve|decline|confirm), POST /api/push/subscribe   (src/workers/missions.ts)
  *   GET  /api/inbox/setup, POST /api/inbox/sync, POST /api/claims/warranty   (src/workers/inbox.ts)
+ *   GET/POST /api/goals, GET /api/goals/<id>, POST /api/goals/<id>/(approve|decline|retry)   (src/workers/goalsApi.ts)
+ *   GET  /api/auth/google/gmail-connect, /api/auth/google/gmail-callback   403 CASA_PENDING unless ENABLE_GMAIL_OAUTH is "true" (src/workers/auth.ts)
+ *   ANY  /apps/<household_id>/<slug>/...   hosted micro-apps; their own credentials (session or signed token) and rules (src/builder/microAppRuntime.ts)
  *
  * Authentication (every route except the two sign-in routes): the sealed __Host-session cookie set by the Google callback, or
  * `Authorization: Bearer <session token>` (src/workers/session.ts); the member must still belong to a live household. Cookie-authenticated
@@ -23,12 +26,14 @@ import { getHome } from '../missions/home';
 import { createGuardedFetch } from '../net/egress';
 import type { Env, IngestFileParams, SignConvention } from '../types';
 import { handleStripeWebhook } from '../billing/stripeWebhook';
-import { authenticate, handleGoogleCallback, handleGoogleLogin, handleLogout, handleMe, passesCsrf, type Auth } from './auth';
+import { GMAIL_CALLBACK_PATH, GMAIL_CONNECT_PATH, authenticate, gmailOauthDisabled, handleGmailCallback, handleGmailConnect, handleGoogleCallback, handleGoogleLogin, handleLogout, handleMe, passesCsrf, type Auth } from './auth';
 import { error, isAlreadyExists, json } from './http';
 import { handleAutoRecharge, handleBalance, handleCheckout } from './billing';
 import { handleConciergeAction, handleCreateAlarm, handleCreateWatch, parseConciergePath } from './concierge';
 import { handleInboxSetup, handleInboxSync, handleWarrantyClaim } from './inbox';
+import { handleGoal, parseGoalPath } from './goalsApi';
 import { handleMission, handlePushSubscribe, parseMissionPath } from './missions';
+import { handleAppRequest } from '../builder/microAppRuntime';
 import { handleReceiptGenerate, handleReceiptLatest, handleShareCard } from './receipt';
 
 export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
@@ -144,6 +149,20 @@ export async function handleApi(request: Request, env: Env, deps: { now?: () => 
   const now = nowFn();
   const path = new URL(request.url).pathname;
 
+  // Gmail consent: the flag is checked before anything else, so while it is off no route here authenticates, reads a cookie or builds a Google URL.
+  if (path === GMAIL_CONNECT_PATH || path === GMAIL_CALLBACK_PATH) {
+    const off = gmailOauthDisabled(env);
+    if (off !== null) return off;
+    if (request.method !== 'GET') return json(405, { error: 'method_not_allowed', message: 'Use GET.' }, { allow: 'GET' });
+    const authDeps = { now: nowFn, fetch: deps.fetch ?? createGuardedFetch({ db: env.DB }) };
+    if (path === GMAIL_CALLBACK_PATH) return handleGmailCallback(request, env, authDeps);
+    const caller = await authenticate(request, env, now);
+    return caller === null ? error(401, 'unauthorized', 'Sign in again.') : handleGmailConnect(request, env, caller, authDeps);
+  }
+
+  // Hosted micro-apps authenticate for themselves (household session, or a signed read-only token), so they sit outside the member API's CSRF rules.
+  if (path.startsWith('/apps/')) return handleAppRequest(request, env, { fetch: deps.fetch ?? createGuardedFetch({ db: env.DB }), now: nowFn });
+
   const publicMethod = PUBLIC_ROUTES[path];
   if (publicMethod !== undefined) {
     if (request.method !== publicMethod) return json(405, { error: 'method_not_allowed', message: `Use ${publicMethod}.` }, { allow: publicMethod });
@@ -154,7 +173,8 @@ export async function handleApi(request: Request, env: Env, deps: { now?: () => 
 
   const mission = parseMissionPath(path);
   const concierge = parseConciergePath(path);
-  const method = mission !== null || concierge !== null ? 'POST' : ROUTES[path];
+  const goal = parseGoalPath(path);
+  const method = mission !== null || concierge !== null ? 'POST' : goal !== null ? request.method : ROUTES[path];
   if (method === undefined) return error(404, 'not_found', 'No such endpoint.');
   if (request.method !== method) return json(405, { error: 'method_not_allowed', message: `Use ${method}.` }, { allow: method });
 
@@ -164,6 +184,7 @@ export async function handleApi(request: Request, env: Env, deps: { now?: () => 
 
   if (mission !== null) return handleMission(request, env, auth, mission, now);
   if (concierge !== null) return handleConciergeAction(env, auth, concierge);
+  if (goal !== null) return handleGoal(request, env, auth, goal, now);
   const network = deps.fetch ?? createGuardedFetch({ db: env.DB });
   switch (path) {
     case '/api/ingest/file':

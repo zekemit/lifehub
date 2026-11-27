@@ -4,7 +4,11 @@
 - ALL vendor accounts (Stripe, Cloudflare, Google Cloud, OpenAI/Anthropic, Duffel, affiliates, domains) are owned by the
   guardian-owned LLC ("the Entity"). Never use Zeke's personal identity. Secrets only via `wrangler secret`.
 - Users 18+ (attested). No Gmail restricted scopes in v1: the Gmail sync engine (`src/connectors/gmailSync.ts`, Milestone 6) ships
-  DORMANT. Sign-in still asks for the two calendar scopes only, and nothing requests `gmail.readonly` until CASA AL1 (§9).
+  DORMANT. Sign-in still asks for the two calendar scopes only. The Gmail consent flow exists (Milestone 7) but is behind
+  `ENABLE_GMAIL_OAUTH` (`wrangler.toml` `[vars]`, shipped `"false"`): while it is anything but exactly `"true"`,
+  `GET /api/auth/google/gmail-connect` and `/gmail-callback` answer 403 `{"error":"CASA_PENDING"}` before a Google URL is built, so nothing requests
+  `gmail.readonly` until CASA AL1 passes and the flag is flipped (§9). Turned on, it is PKCE (S256) with the one scope constant in `gmailSync.ts`,
+  and the refresh token is stored AES-GCM-encrypted in KV.
 - LLM output = proposals with verbatim quotes; deterministic code validates and writes. The LLM never writes to the graph.
 - Never fetch any domain in `policy_blocklist` (Resy, OpenTable, Tock, SevenRooms, api.monarch.com). Engine B = stored
   release rules + step.sleep + human-tapped deep links.
@@ -49,6 +53,17 @@ A 1200x630 SVG the member can post. Privacy is the design: it is built from TWO 
   or member identifier, or any model-written text. The queries behind it return counts and one sum; the SVG is a fixed template into which only those
   values and the escaped `APP_NAME` are written, so there is no other path for data to reach it.
 - Served `private, no-store`, `nosniff`, with `Content-Security-Policy: default-src 'none'` (an SVG opened directly can run script; this one has none).
+
+### 2.4 The 3-tier execution ledger (Milestone 7; the numbers live in `src/goals/tiers.ts` for goals and in the stored templates for cards)
+A run costs credits by what it does, and Gate G8 caps its model spend at `$0.25 * credits` (so the cap and the price can never drift apart).
+| Tier | Name | Credits | G8 cap | What runs |
+|---|---|---|---|---|
+| 1 | Quick Mission | 1 credit | $0.25 | a card from a standing trigger (MissionRunWF) |
+| 2 | Deep Research & Claim Packet | 3 credits | $0.75 | a claim packet (MissionRunWF) or a member's research goal (`research_plan`, GoalExecutionWF) |
+| 3 | Autonomous Micro-App Builder | 5 credits | $1.25 | a member's goal to build and host a small app (`micro_app`, GoalExecutionWF) |
+Goals are priced by `classifyGoal()`, a deterministic text rule (a build verb followed by an app noun, or "install ... on my site", is a `micro_app`;
+anything else is a `research_plan`). No model decides what a goal costs, and `goals` has a CHECK that pins tier, `credits_reserved` and
+`max_cost_usd` together.
 
 ## 3. Schema
 
@@ -266,6 +281,12 @@ CREATE TABLE audit_log (
   `family_event`; triggers `T_CLOSING_RETURN_OR_WARRANTY`, `T_PRICE_DROP_OR_DELAY_CLAIM`, `T_FAMILY_EVENT_AUTOPILOT` (a trigger row may
   return a `template_key` column to stage a different stored template, which is how one trigger stages both a 1-credit and a 3-credit card).
 
+- 0005: `goals`, `goal_tasks`, `micro_apps`, `micro_app_records` (all additive; no existing table is rebuilt) and the predicate `hosted_micro_app`
+  (vault; `dietary_restriction` already exists from 0001 in domain `people` and keeps it). `goals.attempt` counts Workflow instances and
+  `micro_apps.quota_month` is the UTC month `monthly_ai_calls_used` counts. `micro_app_records` and `micro_apps` carry triggers that refuse a row whose
+  household is not its owner's. A goal's debit is an ordinary ledger row keyed by the goal id; `credit_ledger.run_id` references `mission_runs`, so each
+  goal has an inert anchor row there (template `goal_<tier>`, state `CANCELED`, which never shows on Home and holds no Home slot).
+
 ## 4. Deterministic fact write (src/graph/writeFact.ts)
 1. Verify quote: `episodes.redacted_text.slice(char_start,char_end) === quote`, else reject.
 2. Resolve entities: aliases → LLM adjudication (top-3, sim ≥ 0.85) → new entity.
@@ -286,6 +307,7 @@ billed: 500K/mo included, then $0.80 per 100K.
 - LifeReceiptWF (Sun 08:00 local): assemble → ground every claim → email + push.
 - DropAlarmWF: step.sleep until release − 120 s → push R2 card → waitForEvent approve.
 - PriceWatchWF: loop { Duffel search; if ≤ ceiling → MissionRunWF; step.sleep('1 day') }.
+- GoalExecutionWF (§5.4): classify_and_debit → plan_dag → execute_with_self_repair → stage_r2_preview + approval → publish_r3_live.
 
 ### 5.1 MissionRunWF (R0 → R1 → R2 → R3)
 ```ts
@@ -339,6 +361,8 @@ export class MissionRunWF extends WorkflowEntrypoint<Env, RunParams> {
   statement: the SUBSCRIPTION bucket is drained first (it is the one that expires), then the PURCHASED bucket. This is a bucket order, not per-credit
   lots. A balance short by even one credit refuses the whole debit; the entry id is deterministic per run, so a retried step is a no-op.
 - REFUND mirrors the run's debit (same buckets, opposite sign), at most once, on FAILED_GATE or a system error. DECLINED and EXPIRED keep the debit.
+  A goal (§5.4) is the exception: every goal that does not end COMPLETED is refunded in full to the buckets it came from, declined or expired included, because
+  nothing was delivered.
 - GRANTS are idempotent on `stripe_event_id` (UNIQUE): invoices by Stripe event id, packs by `pack:<payment_intent>` (so
   `checkout.session.completed` and `payment_intent.succeeded` for one purchase grant once), annual drips by month. A renewal is one batch:
   expire the subscription excess above 15, then grant.
@@ -348,6 +372,47 @@ export class MissionRunWF extends WorkflowEntrypoint<Env, RunParams> {
   restarts as a NEW Workflow instance named `<run_id>~<n>` (n = the attempt number, from 1); `failure.attempt` makes a double tap start it once.
 - `POST /api/webhooks/stripe`: raw-body HMAC-SHA256 over `t.payload`, 300 s tolerance, idempotent on the event id; handles `invoice.paid`,
   `checkout.session.completed`, `payment_intent.succeeded`, `customer.subscription.deleted`.
+
+### 5.4 GoalExecutionWF (Milestone 7: `src/goals/goalPipeline.ts`, `src/workflows/goalExecutionWF.ts`, `src/workers/goalsApi.ts`)
+`POST /api/goals {prompt_text}` redacts the request (a quarantined one is 422, nothing stored), prices it by tier (§2.4), inserts a `goals` row and starts
+the Workflow (instance id = the goal id; the app links use the request's own origin). `GET /api/goals`, `GET /api/goals/<id>` (with the task DAG),
+`POST /api/goals/<id>/approve {approval_hash}`, `/decline`, `/retry`. Every lookup is scoped by the session's household; another household's goal is 404.
+1. `classify_and_debit`: the tier, credits and cap on the row must equal what `classifyGoal()` says (else `TIER_MISMATCH`). The debit is the ordinary
+   two-bucket debit keyed by the goal id; a household opted in to auto-recharge gets one recharge first. Short of credits: status
+   `INSUFFICIENT_CREDITS`, nothing taken, nothing refunded, and after a top-up `POST /api/goals/<id>/retry` restarts the SAME goal as instance
+   `<goal_id>~<n>` (`goals.attempt` makes a double tap start it once; the debit is idempotent, so a goal is never charged or run twice).
+2. `plan_dag`: the chief model (gpt-6.2-sol) sees the redacted request and the household's redacted facts and orders the task DAG. Code enforces it:
+   the DAG is exactly `context_gather, schema_gen, code_gen, verify_bundle, smoke_test, package_install` for a `micro_app` (the first four for a
+   `research_plan`), whatever the model proposes.
+3. `execute_with_self_repair`: the worker model (gpt-6-luna) generates; code verifies. BEFORE EVERY model call Gate G8 (spend so far + the call's
+   pessimistic cost must not pass the cap) and the 90,000-token ceiling are checked. A failed `verify_bundle` (the sandbox verifier, below) or
+   `smoke_test` (the real runtime run over an in-memory store) is fed back as the exact diagnostics for at most 2 repairs (`goal_tasks.retries`
+   CHECK <= 2). Gate G7 (tax characterization) fails the goal at once, with no repair. On any failure (`G8_COST`, `TOKEN_CLIFF`, `G7_TAX_LANGUAGE`,
+   `REPAIR_EXHAUSTED`, `PROMPT_QUARANTINED`, `PLAN_FAILED`, `SYSTEM_ERROR`) the goal is `FAILED` and the whole reservation is refunded.
+4. `stage_r2_preview` + approval: the verified bundle is encrypted into R2 under `apps/<household>/<app_id>/`, the app is `STAGED` (the member's preview
+   works; production does not), the member gets a payload-less push, and the Workflow waits for `goal_approval:<goal_id>` (7 days). The
+   `approval_hash` covers the goal, the bundle hash, the slug and the install artifact; an approval with another hash is refused by the API (409) and,
+   if one reached the Workflow, declines the goal.
+5. `publish_r3_live`: the stored bundle is re-read, re-hashed and re-verified (tampered or no longer passing: `REGATE_FAILED`, refunded), then the app is
+   `LIVE`, `prod_url` is set, a grounded `hosted_micro_app` fact is written (episode = the request and the published address, verbatim quote) and the
+   goal is `COMPLETED`. Declined or expired: the app is `ARCHIVED`, the goal `DECLINED`, the credits refunded.
+Nothing is deployed to a member's own site: `install_artifact_json` (`embed_snippet`, `cloudflare_pages_patch`, `github_pr_bundle`) is data the member
+applies. The embed carries a read-only token signed for exactly (household_id, app_id).
+
+**Sandbox verifier (`src/builder/sandboxVerifier.ts`)**: deterministic text analysis of a `{manifest, html}` bundle. Rejects `eval`, `new Function`, `Function(`,
+`process.env`, any external script, stylesheet, image, form target, `fetch` target or WebSocket, XHR, beacons, dynamic `import()`, cookies, navigation, `document.write`,
+`javascript:` URLs, `srcdoc`, meta refresh, `<base>`, workers, a global reached by a computed name (`window[...]`), the `.constructor.constructor` route to `Function`, a timer given a string, any `policy_blocklist` origin (Resy, OpenTable, Tock, SevenRooms, api.monarch.com), any household or app id in the
+page (`CROSS_TENANT`), plus manifest checks (known template, slug, routes, collections, AI-call cap <= 100) and accessibility checks (labels, alt text, viewport).
+The page can only call its own relative `api/...` routes.
+
+**Micro-app runtime (`src/builder/microAppRuntime.ts`, `/apps/<household_id>/<slug>/*`)**: callers are a signed-in member of that household or a signed token for
+exactly (household_id, app_id); anything else is 401 (no lookup) or 404 (another household's app does not exist). `ARCHIVED` is 404 for everyone; `STAGED` is served
+only to members and preview tokens, and only `/preview` and `api/`. The flagship recipe book: `POST api/parse-recipe` redacts the text first (a quarantined one is
+422 and costs nothing), counts one AI call against `monthly_ai_calls_cap` (100 a month; the 101st is 429 `QUOTA_EXCEEDED`), sends only the REDACTED text to gpt-6-luna under a
+4,000-token cap, encrypts any photo into R2 under `apps/<household>/<app_id>/` (no pixel ever goes to a model), and stores the row in `micro_app_records` scoped to
+(app_id, household_id); `GET api/search?q=&tag=`; `GET api/suggest` uses the household's live `prefers_cuisine` and `dietary_restriction` facts. Known limit: the app is served
+from the same origin as the member API, so isolation rests on the verifier plus a strict Content-Security-Policy (`default-src 'none'`, `connect-src 'self'`); a dedicated
+apps origin is the planned hardening.
 
 ## 6. Email ingestion
 One catch-all on in.lifehub.app → Email Worker; unknown alias → setReject. 25 MiB cap; larger → reply "please upload".
@@ -366,7 +431,7 @@ through the same funnel, R2 vault and IngestEmailWF: auto-forward to the drop ad
 `GET /api/inbox/setup` returns the drop address, a ready-to-paste Gmail filter, the captured code and link, `forwarding_verified_at`, `gmail_connected`
 and `triage_dropped_bulk_count`; `POST /api/inbox/sync` runs one incremental Gmail sync. The Gmail connector reads `users.history.list` +
 `users.messages.get` through `src/net/egress.ts` with AES-GCM-encrypted KV tokens; with no cursor, or a 404/410 for it, it does a bounded full read of
-the newest 50 messages of the last 90 days. It is dormant (§0): no consent flow requests `gmail.readonly` yet.
+the newest 50 messages of the last 90 days. It is dormant (§0): the consent flow that would request `gmail.readonly` exists but is off (`ENABLE_GMAIL_OAUTH` is `"false"`, 403 `CASA_PENDING`).
 
 ### 6.2 Life-admin extractors and triggers (Milestone 6)
 Facts the model proposes by bucket (subject entity type in brackets; the model proposes, `writeFact()` verifies the quote): `purchase_price_cents`,
@@ -421,4 +486,5 @@ Fail any → do not automate; iterate templates, rerun with new households.
 ## 9. Build order
 Schema + redaction + email → CSV/PDF + headroom + credits → Calendar → NightlySweep + 3 templates → Receipt →
 MissionRunWF + Stripe credits → DropAlarm/PriceWatch + affiliate → inbox funnel + life-admin triggers + dormant Gmail sync engine (M6) →
-Google verification → launch → CASA AL1 → Gmail consent flow (restricted scope, v2) → Plaid (v2).
+GoalExecutionWF + sandboxed micro-apps + the flag-gated Gmail consent flow (M7) →
+Google verification → launch → CASA AL1 → flip `ENABLE_GMAIL_OAUTH` (restricted scope, v2) → Plaid (v2).

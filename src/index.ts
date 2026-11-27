@@ -9,6 +9,7 @@ import type { Env } from './types';
 
 export { CalendarSyncWF } from './workflows/calendarSyncWF';
 export { DropAlarmWF } from './workflows/dropAlarmWF';
+export { GoalExecutionWF } from './workflows/goalExecutionWF';
 export { IngestEmailWF } from './workflows/ingestEmailWF';
 export { IngestFileWF } from './workflows/ingestFileWF';
 export { LifeReceiptWF } from './workflows/lifeReceiptWF';

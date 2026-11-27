@@ -64,7 +64,7 @@ export async function verifySessionToken(secret: string, token: string, now: Dat
 // purpose as both HKDF info and AEAD associated data. Its contents are unreadable to the browser, any change fails authentication,
 // and a cookie sealed for one purpose (the OAuth state) can never be replayed as another (the login session).
 
-export type CookiePurpose = 'session' | 'oauth';
+export type CookiePurpose = 'session' | 'oauth' | 'gmail_oauth';
 
 const COOKIE_VERSION = 'v1';
 
