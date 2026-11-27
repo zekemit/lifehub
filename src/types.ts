@@ -112,6 +112,10 @@ export interface IngestEmailParams {
   size_bytes: number;
   /** SMTP envelope sender (lower-cased). */
   envelope_from: string;
+  /** The inbox funnel's claim on this message (ingested_messages.message_id_norm); the pipeline records the bucket and episode against it. */
+  message_id_norm?: string;
+  /** Which channel delivered it: auto-forward to the drop address, or the Gmail connector. */
+  channel?: 'email_forward' | 'gmail';
 }
 
 /** Payload of a CalendarSyncWF instance. When `then_sweep` is set the workflow starts NightlySweepWF when it finishes. */
@@ -163,6 +167,7 @@ export type MemberRole = (typeof MEMBER_ROLES)[number];
 export const CONNECTOR_KINDS = [
   'email_alias',
   'google_calendar',
+  'gmail',
   'spend_csv',
   'spend_pdf',
   'card_list',

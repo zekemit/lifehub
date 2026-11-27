@@ -3,7 +3,8 @@
 ## 0. Ground rules
 - ALL vendor accounts (Stripe, Cloudflare, Google Cloud, OpenAI/Anthropic, Duffel, affiliates, domains) are owned by the
   guardian-owned LLC ("the Entity"). Never use Zeke's personal identity. Secrets only via `wrangler secret`.
-- Users 18+ (attested). No Gmail restricted scopes in v1.
+- Users 18+ (attested). No Gmail restricted scopes in v1: the Gmail sync engine (`src/connectors/gmailSync.ts`, Milestone 6) ships
+  DORMANT. Sign-in still asks for the two calendar scopes only, and nothing requests `gmail.readonly` until CASA AL1 (§9).
 - LLM output = proposals with verbatim quotes; deterministic code validates and writes. The LLM never writes to the graph.
 - Never fetch any domain in `policy_blocklist` (Resy, OpenTable, Tock, SevenRooms, api.monarch.com). Engine B = stored
   release rules + step.sleep + human-tapped deep links.
@@ -18,10 +19,36 @@ Workers (Paid), Workflows, D1 (control + shard DBs), R2 (encrypted docs), KV (en
 (catch-all → Email Worker), Email Sending (Receipt), Queues. Pages (React/Vite PWA + Web Push). Stripe Billing (Entity
 Standard account). Google scopes: openid email calendar.events.readonly calendar.freebusy. Duffel search only.
 
-## 2. D1 constraints
+## 2. D1 constraints, plans and the share card
+
+### 2.1 D1 constraints
 10 GB hard cap/DB; 1,000 queries/invocation; 100 bound params; 2 MB/row; 30 s/query; 50 MB max result (since 2026-11-04);
 serial per DB. Tenancy: `control` DB + `shard_00..03`; shard = fnv1a(household_id) % 4. Every table keyed by household_id;
 repository layer injects it. Use db.batch(); paginate at 500 rows.
+
+### 2.2 Plans, credits and packs (live since Milestone 5; the numbers live in `src/billing/packs.ts` and nowhere else)
+| Item | Rule |
+|---|---|
+| Day-1 trial | +5 credits, once, in the household-creation batch (`stripe_event_id = 'trial:' \|\| household_id`, so it can never grant twice) |
+| Monthly plan | +15 on each paid `invoice.paid` |
+| Annual plan | +12 on the FIRST paid invoice, then +12 each month from the hourly cron drip (`annual_drip:<household>:<YYYY-MM>`) until `plan_period_end` |
+| $0 invoice | grants nothing |
+| Rollover | at each renewal, unused SUBSCRIPTION credits above 15 expire first, then the new grant lands. Purchased credits are never touched |
+| Top-up packs (never expire) | `pack_10` +10 / $9.99, `pack_25` +25 / $19.99, `pack_60` +60 / $39.99 (Stripe Checkout; metadata `{household_id, pack_sku, credits}`) |
+| Auto-recharge | opt-in, saved card, default `pack_10`, default cap $20 per UTC calendar month; failed attempts do not count against the cap |
+| Weight | a run debits its template's `credits_cost`: 1 for an ordinary card, 3 for a claim packet (warranty, price-drop, delay) |
+| Gate G8 | model spend of a run <= `$0.25 * credit_cost` (linear: 1 -> $0.25, 3 -> $0.75), and no worker call above 90,000 input tokens |
+
+### 2.3 Shareable Achievement Card (`GET /api/receipt/share-card.svg`)
+A 1200x630 SVG the member can post. Privacy is the design: it is built from TWO aggregate numbers and the product name, and nothing else.
+- Money recovered is bucketed DOWN to a $100 step and shown as "$400+" (`bucketDollars`: 9,999 cents -> $0, 10,000 -> $100, 39,999 -> $300, 40,000 -> $400). Below $100 the
+  card says the product "is finding card credits for you" and shows no amount. Recovered = confirmed credit-recovery runs only
+  (`expiring_credit`, `anniv_dining`), weighted by confidence like the Home header.
+- Documents filed is a plain count of ingested documents that yielded at least one fact. "0 prompts typed" is a constant: the product has no prompt box.
+- It NEVER contains a merchant, card or card product, venue, date, place, person, account number, tax value or tax characterization, a household
+  or member identifier, or any model-written text. The queries behind it return counts and one sum; the SVG is a fixed template into which only those
+  values and the escaped `APP_NAME` are written, so there is no other path for data to reach it.
+- Served `private, no-store`, `nosniff`, with `Content-Security-Policy: default-src 'none'` (an SVG opened directly can run script; this one has none).
 
 ## 3. Schema
 
@@ -163,8 +190,9 @@ CREATE TABLE mission_runs (
   household_id TEXT NOT NULL, template_key TEXT NOT NULL, template_version INTEGER NOT NULL,
   origin TEXT NOT NULL CHECK (origin IN ('trigger','user','receipt')), params_json TEXT NOT NULL,
   state TEXT NOT NULL CHECK (state IN ('COMPILED','R0_READ','R1_STAGED','GATED','R2_AWAITING','R2_APPROVED',
-        'R3_LINK_ISSUED','CONFIRMED','EXPIRED','DECLINED','FAILED_GATE','CANCELED')),
+        'R3_LINK_ISSUED','CONFIRMED','EXPIRED','DECLINED','FAILED_GATE','CANCELED','INSUFFICIENT_CREDITS')),
   expires_at TEXT, cost_usd REAL NOT NULL DEFAULT 0,
+  credit_cost INTEGER NOT NULL DEFAULT 1,                  -- credits this run charges (its template's credits_cost); Gate G8 scales by it
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
 CREATE INDEX ix_runs_hh_state ON mission_runs(household_id, state);
@@ -200,14 +228,19 @@ INSERT INTO policy_blocklist VALUES
  ('opentable.com','ToS restricts bots/AI assistants'),('exploretock.com','ToS'),('sevenrooms.com','ToS'),
  ('api.monarch.com','Personal non-commercial use only; approved apps only');
 
--- CREDIT LEDGER (append-only)
+-- CREDIT LEDGER (append-only; two buckets since migration 0003, see §2.2 and §5.3)
 CREATE TABLE credit_ledger (
-  entry_id TEXT PRIMARY KEY, household_id TEXT NOT NULL, delta INTEGER NOT NULL,
-  reason TEXT NOT NULL CHECK (reason IN ('monthly_grant','pack_purchase','mission_debit','mission_refund','admin_adjust','expiry')),
+  entry_id TEXT PRIMARY KEY, household_id TEXT NOT NULL,
+  delta INTEGER NOT NULL,                                  -- = sub_delta + pur_delta
+  sub_delta INTEGER NOT NULL DEFAULT 0,                    -- subscription bucket (trial + monthly grants; expires down to the rollover cap)
+  pur_delta INTEGER NOT NULL DEFAULT 0,                    -- purchased bucket (packs; never expires)
+  reason TEXT NOT NULL CHECK (reason IN ('trial_grant','monthly_grant','pack_purchase','mission_debit','mission_refund','admin_adjust','expiry')),
+  -- table CHECKs: pack_purchase -> purchased only; trial_grant / monthly_grant -> subscription only; expiry -> subscription only and negative
   run_id TEXT REFERENCES mission_runs(run_id), stripe_event_id TEXT UNIQUE,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
 CREATE INDEX ix_ledger_hh ON credit_ledger(household_id, created_at);
-CREATE VIEW credit_balance AS SELECT household_id, SUM(delta) AS balance FROM credit_ledger GROUP BY household_id;
+CREATE VIEW credit_balance AS SELECT household_id, SUM(delta) AS balance,
+  SUM(sub_delta) AS subscription_credits, SUM(pur_delta) AS purchased_credits FROM credit_ledger GROUP BY household_id;
 CREATE TRIGGER ledger_no_update BEFORE UPDATE ON credit_ledger BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER ledger_no_delete BEFORE DELETE ON credit_ledger BEGIN SELECT RAISE(ABORT,'append-only'); END;
 
@@ -220,6 +253,18 @@ CREATE TABLE audit_log (
   id TEXT PRIMARY KEY, household_id TEXT, actor TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
 ```
+
+### 3.1 Added since this schema (migrations 0002-0004; the migrations are the source of truth)
+- 0002: `free_window` predicate; templates and standing triggers (a trigger is ONE stored read-only SELECT using `?1` household, `?2` now, `?3` today).
+- 0003: the two-bucket ledger above; `households.stripe_default_payment_method_id`, `auto_recharge_enabled`, `auto_recharge_pack_sku`
+  (default `pack_10`), `auto_recharge_monthly_cap_cents` (default 2000), `plan_period_end`; `stripe_events`, `auto_recharges`, `life_receipts`,
+  `drop_alarms`; extra `price_watches` columns and the at-most-2-active-watches triggers; templates `drop_alarm`, `flight_watch`.
+- 0004: `connectors.kind` admits `'gmail'`; `inbox_connections`, `ingested_messages` (§6.1); predicates `purchase_price_cents`,
+  `return_window_closes_on`, `price_drop_detected_cents` (budget), `warranty_expires_on`, `serial_number` (vault), `flight_delay_minutes`,
+  `registration_opens_at`, `required_checklist_item`, `event_window` (calendar) - every domain is one of the six the CHECK allows
+  (`people, cards, budget, calendar, taste, vault`); templates `return_deadline`, `warranty_claim`, `price_drop_claim`, `delay_claim`,
+  `family_event`; triggers `T_CLOSING_RETURN_OR_WARRANTY`, `T_PRICE_DROP_OR_DELAY_CLAIM`, `T_FAMILY_EVENT_AUTOPILOT` (a trigger row may
+  return a `template_key` column to stage a different stored template, which is how one trigger stages both a 1-credit and a 3-credit card).
 
 ## 4. Deterministic fact write (src/graph/writeFact.ts)
 1. Verify quote: `episodes.redacted_text.slice(char_start,char_end) === quote`, else reject.
@@ -234,9 +279,10 @@ Limits: 10,000 steps/instance (configurable to 25,000); step result ≤ 1 MiB; s
 24 h (always set explicitly); waiting instances don't count toward concurrency and burn no CPU. Steps (incl. sleep/wait)
 billed: 500K/mo included, then $0.80 per 100K.
 
-- IngestEmailWF: MIME → R2 (encrypted) → redact → extract (Luna) → writeFact batch.
+- IngestEmailWF: [funnel layers 0-2, §6.1] MIME → R2 (encrypted) → redact → classify (Luna, layer 3) → bucket-aware extract (Luna) →
+  writeFact batch → evaluate the three life-admin triggers and stage new cards.
 - IngestFileWF: CSV/PDF → dedupe → categorize (rules, then Luna) → recompute credit_periods.
-- NightlySweepWF (03:00 local): decay → headroom/credits → evaluate triggers → start MissionRunWF.
+- NightlySweepWF (03:00 local): decay → headroom/credits → evaluate triggers (every stored trigger, M6's three included) → stage cards.
 - LifeReceiptWF (Sun 08:00 local): assemble → ground every claim → email + push.
 - DropAlarmWF: step.sleep until release − 120 s → push R2 card → waitForEvent approve.
 - PriceWatchWF: loop { Duffel search; if ≤ ceiling → MissionRunWF; step.sleep('1 day') }.
@@ -282,17 +328,59 @@ export class MissionRunWF extends WorkflowEntrypoint<Env, RunParams> {
 | G5 policy | No fetch to blocklisted domains (egress allowlist in fetch wrapper) |
 | G6 tier | max_tier respected; R3 only via deeplinks; lint bans payment APIs |
 | G7 tax-language | Bans "deductible", "you can deduct", "enter on line" |
-| G8 cost | Run ≤ $0.60; worker input ≤ 90K tokens |
+| G8 cost | Run model cost ≤ $0.25 × credit_cost (1 → $0.25, 3 → $0.75); worker input ≤ 90K tokens |
 | G9 idempotency | No duplicate run within cooldown |
 
-### 5.3 Credits
-Grant +10 (monthly) / +8 (annual) on Stripe `invoice.paid`; +10 on pack `checkout.session.completed`; idempotent on
-stripe_event_id. Debit 1 at compile; refund on FAILED_GATE/system error; none on DECLINED/EXPIRED. Monthly grants roll
-over 1 month max.
+### 5.3 Credits (two buckets; the numbers are in §2.2)
+- `credit_ledger` is append-only and every row moves both buckets: `delta = sub_delta + pur_delta`. Table CHECKs: a pack goes to the purchased
+  bucket only, trial and monthly grants to the subscription bucket only, an `expiry` row is subscription-only and negative (so it cannot touch
+  purchased credits).
+- DEBIT at compile = the template's `credits_cost`, taken by ONE conditional INSERT that decides the split and checks the balance in the same
+  statement: the SUBSCRIPTION bucket is drained first (it is the one that expires), then the PURCHASED bucket. This is a bucket order, not per-credit
+  lots. A balance short by even one credit refuses the whole debit; the entry id is deterministic per run, so a retried step is a no-op.
+- REFUND mirrors the run's debit (same buckets, opposite sign), at most once, on FAILED_GATE or a system error. DECLINED and EXPIRED keep the debit.
+- GRANTS are idempotent on `stripe_event_id` (UNIQUE): invoices by Stripe event id, packs by `pack:<payment_intent>` (so
+  `checkout.session.completed` and `payment_intent.succeeded` for one purchase grant once), annual drips by month. A renewal is one batch:
+  expire the subscription excess above 15, then grant.
+- INSUFFICIENT_CREDITS: if the buckets cannot cover the run, an opted-in household first gets ONE off-session auto-recharge (saved card, within its
+  monthly cap, reserved atomically before Stripe is called). Otherwise the run halts in `INSUFFICIENT_CREDITS` and the card points at
+  `POST /api/credits/checkout`. Nothing was taken, so nothing is refunded. The state is not terminal: after a top-up the member taps again and the SAME run
+  restarts as a NEW Workflow instance named `<run_id>~<n>` (n = the attempt number, from 1); `failure.attempt` makes a double tap start it once.
+- `POST /api/webhooks/stripe`: raw-body HMAC-SHA256 over `t.payload`, 300 s tolerance, idempotent on the event id; handles `invoice.paid`,
+  `checkout.session.completed`, `payment_intent.succeeded`, `customer.subscription.deleted`.
 
 ## 6. Email ingestion
 One catch-all on in.lifehub.app → Email Worker; unknown alias → setReject. 25 MiB cap; larger → reply "please upload".
 Accept if SPF/DKIM pass or sender ∈ member forwarding addresses. Raw MIME to R2 (AES-GCM, per-household DEK wrapped by KEK).
+
+### 6.1 The inbox funnel (Milestone 6: `src/ingest/inboxTriage.ts`)
+A 2,000-message-a-month inbox must not burn model tokens or pollute `facts_current`. Mail reaches the household by two channels, and BOTH go
+through the same funnel, R2 vault and IngestEmailWF: auto-forward to the drop address, and the Gmail connector (`src/connectors/gmailSync.ts`).
+| Layer | Where | Rule | Cost |
+|---|---|---|---|
+| 0 dedupe | before R2 | `message_id_norm` = sha256 of the normalized Message-ID (else of From + Subject + Date). The first arrival, by either channel, claims `ingested_messages(household_id, message_id_norm)` atomically; the second is a duplicate | no R2, no model |
+| 1 bulk | before R2 | a bulk header (`List-Unsubscribe`, `Precedence: bulk/list/junk`, `Auto-Submitted` other than `no`, `X-Campaign*`) AND none of the high-signal tokens (order, receipt, invoice, total, confirmation, flight, itinerary, airline, delay, warranty, serial, policy, claim, return, refund, statement, due, school, camp, registration, permission, roster, appointment, tax, 1099, w-2, .pdf, .ics) in the subject, the first 20,000 body characters or the attachment names => `DROPPED_BULK`, counted in `inbox_connections.triage_dropped_bulk_count` | no R2, no model |
+| 2 forwarding confirmation | before R2, BEFORE `redact()` would quarantine its code | a Gmail (`forwarding-noreply@google.com`), Outlook or iCloud "confirm auto-forwarding" message is recognized only if it is from the provider's own sender or domain AND its topmost Authentication-Results shows DKIM/SPF passing AS that domain. Its confirmation code and a link whose host is the provider's are saved to `inbox_connections` for the member (the link is shown, NEVER fetched); the message is not stored. Anything else, including every other one-time code, bank code, password and PIN, goes on to `redact()` and is quarantined | no R2, no model |
+| 3 micro-classifier | inside IngestEmailWF, after `redact()` (a quarantined episode never reaches it) | `from`, `subject` (each redacted) and the first 600 characters of `redacted_text`, at most 2,000 input tokens, to the worker model: one of `RECEIPT_ORDER, BILL_SUBSCRIPTION, TRAVEL_ITINERARY, WARRANTY_PRODUCT, TAX_LEGAL_DOC, FAMILY_SCHOOL_EVENT, PERSONAL_FOLLOWUP_NEEDED, IGNORE`. `IGNORE` is recorded and stops before any fact extraction; any other bucket selects the extraction profile (`src/ingest/extractors.ts`) | one small call |
+`forwarding_verified_at` is stamped by the first ordinary message that arrives AFTER a confirmation was captured; the one-time code and link are then cleared.
+`GET /api/inbox/setup` returns the drop address, a ready-to-paste Gmail filter, the captured code and link, `forwarding_verified_at`, `gmail_connected`
+and `triage_dropped_bulk_count`; `POST /api/inbox/sync` runs one incremental Gmail sync. The Gmail connector reads `users.history.list` +
+`users.messages.get` through `src/net/egress.ts` with AES-GCM-encrypted KV tokens; with no cursor, or a 404/410 for it, it does a bounded full read of
+the newest 50 messages of the last 90 days. It is dormant (§0): no consent flow requests `gmail.readonly` yet.
+
+### 6.2 Life-admin extractors and triggers (Milestone 6)
+Facts the model proposes by bucket (subject entity type in brackets; the model proposes, `writeFact()` verifies the quote): `purchase_price_cents`,
+`return_window_closes_on`, `warranty_expires_on`, `serial_number`, `price_drop_detected_cents` [product]; `flight_delay_minutes` [trip];
+`registration_opens_at`, `required_checklist_item`, `event_window` [event]. Three standing triggers stage R2 cards (the member does the return, the
+claim or the registration; nothing is sent or booked), each grounded in verbatim quotes (G1) and weighted by `credits_cost`:
+| Trigger | Staged when | Credits | G8 cap |
+|---|---|---|---|
+| `T_CLOSING_RETURN_OR_WARRANTY` | a return window closes within 5 days on an item of $40+ | 1 (`return_deadline`) | $0.25 |
+| | a warranty expires within 30 days, or the member requests the packet (`POST /api/claims/warranty`) | 3 (`warranty_claim`) | $0.75 |
+| `T_PRICE_DROP_OR_DELAY_CLAIM` | a price drop of $15+ inside the return/adjustment window of a purchase (both money facts confirmed within 35 days) | 3 (`price_drop_claim`) | $0.75 |
+| | a flight delay or cancellation of 180+ minutes with the booking on record, noted in the last 90 days | 3 (`delay_claim`) | $0.75 |
+| `T_FAMILY_EVENT_AUTOPILOT` | an event whose registration opens today or later, within 90 days, with up to five checklist items | 1 (`family_event`) | $0.25 |
+A claim packet is drafted by the worker model from the verbatim quotes behind the card; it is assistive text, never a claim, and passes Gate G7.
 
 ## 7. Day-1 Onboarding (60 s) + Home
 | t (s) | Screen | Copy / control | Backend |
@@ -332,5 +420,5 @@ Fail any → do not automate; iterate templates, rerun with new households.
 
 ## 9. Build order
 Schema + redaction + email → CSV/PDF + headroom + credits → Calendar → NightlySweep + 3 templates → Receipt →
-MissionRunWF + Stripe credits → DropAlarm/PriceWatch + affiliate → Google verification → launch → CASA AL1 → Gmail (v2)
-→ Plaid (v2).
+MissionRunWF + Stripe credits → DropAlarm/PriceWatch + affiliate → inbox funnel + life-admin triggers + dormant Gmail sync engine (M6) →
+Google verification → launch → CASA AL1 → Gmail consent flow (restricted scope, v2) → Plaid (v2).

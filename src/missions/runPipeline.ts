@@ -14,9 +14,10 @@
  *   - R3 is a deep link. Nothing is booked, paid or fetched from a merchant.
  */
 
-import { evaluateTrigger, loadTriggers, type ClaimRef } from './engine';
+import { evaluateTrigger, loadTriggers, loadVerifiedEvidence, type ClaimRef } from './engine';
 import { buildCopy } from './copy';
 import { buildDeepLink, parseAffiliateTags, resolveDomain, type DeepLink } from './deeplinks';
+import { warrantyCandidate } from './triggers';
 import { runGates, type CardPayload, type FactState, type FreshWindow, type GateOutcome, type PlanStep, type ReadContext } from './gates';
 import { attemptAutoRecharge, type AutoRechargeResult } from '../billing/autoRecharge';
 import { debitCredit, refundCredit } from '../billing/credits';
@@ -128,6 +129,11 @@ const CARD_KIND: Readonly<Record<string, CardPayload['kind']>> = {
   occasion_plan: 'plan',
   drop_alarm: 'drop_alarm',
   flight_watch: 'flight_deal',
+  return_deadline: 'return_deadline',
+  warranty_claim: 'claim_packet',
+  price_drop_claim: 'claim_packet',
+  delay_claim: 'claim_packet',
+  family_event: 'event_checklist',
 };
 
 export interface Compiled {
@@ -235,6 +241,29 @@ async function freshWindows(deps: MissionDeps, c: Compiled): Promise<ReadContext
   }
 }
 
+export interface EvidenceLine {
+  claim: string;
+  predicate: string;
+  quote: string;
+}
+
+const MAX_EVIDENCE_LINES = 8;
+const MAX_EVIDENCE_CHARS = 300;
+
+/** The verified quotes behind each claim's facts, first quote per fact: what a claim packet may cite. */
+export async function claimEvidence(db: D1Database, household_id: string, claims: readonly ClaimRef[]): Promise<EvidenceLine[]> {
+  const ids = [...new Set(claims.flatMap((c) => c.facts).filter((f): f is string => typeof f === 'string' && f !== ''))];
+  const evidence = await loadVerifiedEvidence(db, household_id, ids);
+  const lines: EvidenceLine[] = [];
+  for (const claim of claims) {
+    for (const fact of claim.facts) {
+      const first = fact === null ? undefined : (evidence.get(fact) ?? [])[0];
+      if (first !== undefined && lines.length < MAX_EVIDENCE_LINES) lines.push({ claim: claim.key, predicate: first.predicate, quote: first.quote.slice(0, MAX_EVIDENCE_CHARS) });
+    }
+  }
+  return lines;
+}
+
 export async function readFacts(deps: MissionDeps, c: Compiled): Promise<ReadResult> {
   // Engine B templates (drop alarms, flight price watches) read their own sources instead of a stored SQL trigger.
   const concierge = await readConcierge(deps, c);
@@ -243,7 +272,13 @@ export async function readFacts(deps: MissionDeps, c: Compiled): Promise<ReadRes
   const now = deps.now();
   const kind = CARD_KIND[c.template_key];
   const trigger = (await loadTriggers(db)).find((t) => t.trigger_key === c.trigger_key);
-  const found = trigger === undefined ? undefined : (await evaluateTrigger(db, c.household_id, trigger, now)).candidates.find((x) => x.dedupe_key === c.dedupe_key);
+  let found = trigger === undefined ? undefined : (await evaluateTrigger(db, c.household_id, trigger, now)).candidates.find((x) => x.dedupe_key === c.dedupe_key);
+  if (found === undefined && c.template_key === 'warranty_claim') {
+    // a packet the member asked for before the 30-day trigger would surface it: the card still stands while that warranty fact is current and unexpired
+    const [kind, subject_id, expires_on] = c.dedupe_key.split('|');
+    const own = kind === 'warranty' && subject_id !== undefined && expires_on !== undefined ? await warrantyCandidate(db, c.household_id, subject_id, now) : null;
+    if (own !== null && own.dedupe_key === c.dedupe_key) found = own;
+  }
 
   let envelope_key: string | null = null;
   let headroom_cents: number | null = null;
@@ -267,10 +302,13 @@ export async function readFacts(deps: MissionDeps, c: Compiled): Promise<ReadRes
   const claims = found?.claims ?? [];
   const calendar: ReadContext['calendar'] =
     kind === 'dinner_plan' ? await freshWindows(deps, c) : { required: false, fetched_at: null, windows: [], error: null };
+  // A claim packet is drafted from the verbatim quotes behind its claims (re-verified now), so the draft can cite them word for word.
+  const data = found?.data ?? {};
+  if (found !== undefined && kind === 'claim_packet') data['evidence'] = await claimEvidence(db, c.household_id, claims);
   return {
     read: {
       candidate_found: found !== undefined,
-      data: found?.data ?? {},
+      data,
       claims,
       facts: await factStates(db, c.household_id, claims, now),
       headroom_cents,
@@ -297,8 +335,39 @@ const GUARDRAILS =
   'Write plain, polite text a person can read aloud. Use only the facts given. Do not say anything about taxes, deductions or write-offs. ' +
   'Do not include account numbers, links or anything you were not given.';
 
+const CLAIM_GUARDRAILS =
+  `${GUARDRAILS} Where you cite the evidence, quote it word for word inside quotation marks. ` +
+  'Do not state legal rights, entitlements, deadlines or amounts that you were not given. Leave [placeholders] for anything the household must fill in.';
+
+function evidenceBlock(d: Record<string, unknown>): string {
+  const lines = Array.isArray(d['evidence']) ? (d['evidence'] as Array<Record<string, unknown>>) : [];
+  if (lines.length === 0) return 'Evidence: none on record\n';
+  return `Evidence (verbatim from the household's own messages):\n${lines.map((l) => `- ${str(l['predicate'])}: "${str(l['quote'])}"`).join('\n')}\n`;
+}
+
 /** Template worker_prompt_id -> prompt. Prompts are code, not data: a model never chooses which prompt runs. */
 export const WORKER_PROMPTS: Readonly<Record<string, WorkerPrompt>> = {
+  warranty_claim_packet: {
+    system: `You draft a short warranty claim message that a household can send to a manufacturer or retailer. ${CLAIM_GUARDRAILS}`,
+    user: (d) =>
+      `Product: ${str(d['product'])}\nWarranty ends: ${str(d['expires_on'])}\nSerial number: ${str(d['serial'], 'not on record')}\n${evidenceBlock(d)}` +
+      'Write a subject line, then 5-8 lines: what the product is, its serial number when given, that the warranty is in effect until the date above, ' +
+      'that the household is asking for it to be inspected or repaired under warranty with [describe the problem], and a request for a written reply.',
+  },
+  price_drop_claim_packet: {
+    system: `You draft a short, polite price-adjustment request that a household can send to a retailer. ${CLAIM_GUARDRAILS}`,
+    user: (d) =>
+      `Product: ${str(d['product'])}\nPaid: ${dollars(d['purchase_cents'])}\nPrice dropped by: ${dollars(d['drop_cents'])}\nWindow ends: ${str(d['window_ends'])}\n${evidenceBlock(d)}` +
+      'Write a subject line, then 4-7 lines: what was bought and when [order number], that the price fell by the amount above inside the window, ' +
+      'a request for a refund of the difference or a price match, and a request for written confirmation.',
+  },
+  delay_claim_packet: {
+    system: `You draft a short claim that a household can send to an airline after a long delay. ${CLAIM_GUARDRAILS}`,
+    user: (d) =>
+      `Flight: ${str(d['trip'])}\nDelay: ${cents(d['delay_minutes'])} minutes\n${evidenceBlock(d)}` +
+      'Write a subject line, then 5-8 lines: the booking [booking reference], that the flight was delayed by the length above, ' +
+      "a request for the compensation or reimbursement the airline's own policy provides for a delay of that length, and a request for a written reply.",
+  },
   retention_script: {
     system: `You write a short phone script for asking a credit card issuer for a retention offer before an annual fee posts. ${GUARDRAILS}`,
     user: (d) =>

@@ -280,10 +280,14 @@ test('CALENDAR OAUTH: the consent URL asks for exactly openid, email, calendar.e
 test('CALENDAR OAUTH: no other Google scope appears anywhere in the source', () => {
   const root = resolve(process.env['PROJECT_ROOT'] ?? process.cwd(), 'src');
   const walk = (dir: string): string[] => readdirSync(dir).flatMap((n) => (statSync(join(dir, n)).isDirectory() ? walk(join(dir, n)) : n.endsWith('.ts') ? [join(dir, n)] : []));
+  // Milestone 6's Gmail sync engine is the ONE file allowed to name gmail.readonly: it is dormant (nothing requests that scope), and
+  // test/milestone6.test.ts pins what it may say and that sign-in cannot ask for it. Every other file is held to the Milestone 3 rule.
+  const engine = join(root, 'connectors', 'gmailSync.ts');
+  const files = walk(root).filter((f) => f !== engine);
   const scopes = new Set<string>();
-  for (const f of walk(root)) for (const m of readFileSync(f, 'utf8').matchAll(/googleapis\.com\/auth\/([a-z.]+)/g)) scopes.add(m[1]!);
+  for (const f of files) for (const m of readFileSync(f, 'utf8').matchAll(/googleapis\.com\/auth\/([a-z.]+)/g)) scopes.add(m[1]!);
   assert.deepEqual([...scopes].sort(), ['calendar.events.readonly', 'calendar.freebusy', 'userinfo.email']);
-  assert.ok(!walk(root).some((f) => /gmail\.(readonly|modify|send|compose)|mail\.google\.com/.test(readFileSync(f, 'utf8'))));
+  assert.ok(!files.some((f) => /gmail\.(readonly|modify|send|compose)|mail\.google\.com/.test(readFileSync(f, 'utf8'))));
 });
 
 test('CALENDAR OAUTH: tokens are exchanged, stored AES-GCM-encrypted in KV under the household key, and refreshed on demand', async () => {
@@ -588,7 +592,7 @@ test("DECAY: stale habit facts close after decay_days, non-decaying predicates a
 
 test('TRIGGERS: stored SQL must be a single read-only SELECT scoped by ?1; the seeded triggers all pass and unsafe rows are never run', async () => {
   for (const t of await loadTriggers(db)) assert.doesNotThrow(() => assertSafeTriggerSql(t.sql_condition), t.trigger_key);
-  assert.deepEqual((await loadTriggers(db)).map((t) => t.trigger_key), ['T_ANNIV_DINING', 'T_ANNUAL_FEE_ROI', 'T_EXPIRING_CREDIT', 'T_OCCASION_PLAN', 'T_SUBSCRIPTION_CREEP']);
+  assert.deepEqual((await loadTriggers(db)).map((t) => t.trigger_key), ['T_ANNIV_DINING', 'T_ANNUAL_FEE_ROI', 'T_CLOSING_RETURN_OR_WARRANTY', 'T_EXPIRING_CREDIT', 'T_FAMILY_EVENT_AUTOPILOT', 'T_OCCASION_PLAN', 'T_PRICE_DROP_OR_DELAY_CLAIM', 'T_SUBSCRIPTION_CREEP']);
   const bad = [
     'DELETE FROM facts WHERE household_id = ?1', 'SELECT 1 FROM facts WHERE household_id = ?1; DROP TABLE facts', 'SELECT * FROM facts',
     "WITH x AS (SELECT 1) INSERT INTO audit_log (id, actor, action) SELECT 'a', 'b', 'c' FROM x WHERE ?1 = ?1", 'UPDATE facts SET value_text = NULL WHERE household_id = ?1',

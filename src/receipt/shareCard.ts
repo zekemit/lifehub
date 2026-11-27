@@ -38,7 +38,7 @@ export async function shareStats(db: D1Database, household_id: string): Promise<
   return { recovered_cents: recovered?.cents ?? 0, documents_filed: docs?.n ?? 0 };
 }
 
-/** $100 steps, rounded down. 39_999 cents -> 0; 40_000 -> 400. */
+/** $100 steps, rounded down. 9_999 cents -> 0; 10_000 -> 100; 39_999 -> 300; 40_000 -> 400. */
 export const bucketDollars = (cents: number): number => Math.floor(Math.max(0, cents) / SHARE_BUCKET_CENTS) * 100;
 
 export function renderShareCard(stats: ShareStats, appName: string): string {

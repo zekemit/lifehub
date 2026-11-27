@@ -506,7 +506,8 @@ async function runEmail(h: Household, raw: Uint8Array, handler: ProviderHandler,
   const store = o.counter?.db ?? db;
   const { gateway, calls } = gatewayWith(handler, { db: store });
   const { step, log } = directStep(o.counter);
-  const result: EmailPipelineResult = await runIngestEmail({ env: { ...env, DB: store }, gateway }, params, step);
+  // M2 tests the extraction path on its own: no classifier call, no card staging (Milestone 6's triage and triggers have their own suite)
+  const result: EmailPipelineResult = await runIngestEmail({ env: { ...env, DB: store }, gateway, triage: false, triggers: false }, params, step);
   return { result, calls, log, params };
 }
 

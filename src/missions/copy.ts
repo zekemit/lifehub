@@ -38,6 +38,13 @@ export function weekdayOf(iso: string): string {
   return DAYS[new Date(`${iso.slice(0, 10)}T00:00:00Z`).getUTCDay()] ?? '';
 }
 
+/** 200 -> "3 h 20 min", 45 -> "45 min". */
+export function duration(minutes: number): string {
+  const m = Math.max(0, Math.round(minutes));
+  const h = Math.floor(m / 60);
+  return h === 0 ? `${m} min` : m % 60 === 0 ? `${h} h` : `${h} h ${m % 60} min`;
+}
+
 const str = (v: unknown, fallback = ''): string => (typeof v === 'string' ? v : fallback);
 const num = (v: unknown): number => (typeof v === 'number' ? v : 0);
 const benefitName = (label: string): string => label.split(':')[0]?.trim() || label;
@@ -155,6 +162,64 @@ export function buildCopy(triggerKey: string, d: Data): CardCopy {
         r2_label: 'Open the booking page',
         unconfirmed: false,
         claims: { watch: `You asked to watch ${trip} (${dates}) for fares under ${usd(num(d['ceiling_cents']))}` },
+      };
+      break;
+    }
+    case 'T_CLOSING_RETURN_OR_WARRANTY': {
+      const product = str(d['product'], 'this item');
+      if (str(d['kind']) === 'return') {
+        copy = {
+          title: `The return window for ${product} closes ${shortDate(str(d['closes_on']))} — ${usd(num(d['price_cents']))} is still returnable`,
+          why: `Decide before ${shortDate(str(d['closes_on']))}: keep it, or return it for a refund.`,
+          r2_label: 'Plan the return',
+          unconfirmed: false,
+          claims: { window: `The return window for ${product} closes on ${shortDate(str(d['closes_on']))}` },
+        };
+      } else {
+        const serial = str(d['serial']);
+        copy = {
+          title: `The warranty on ${product} ends ${shortDate(str(d['expires_on']))}`,
+          why: serial === '' ? 'If anything is wrong with it, now is the time. A claim packet can be drafted from your records.' : `If anything is wrong with it, now is the time. A claim packet can be drafted from your records, with serial number ${serial}.`,
+          r2_label: 'Draft the claim packet',
+          unconfirmed: false,
+          claims: { warranty: `The warranty on ${product} ends on ${shortDate(str(d['expires_on']))}` },
+        };
+      }
+      break;
+    }
+    case 'T_PRICE_DROP_OR_DELAY_CLAIM': {
+      if (str(d['kind']) === 'delay') {
+        const trip = str(d['trip'], 'your flight');
+        const length = duration(num(d['delay_minutes']));
+        copy = {
+          title: `${trip} was delayed ${length} — you may be owed compensation`,
+          why: 'Your booking and the airline\'s update are attached to a draft claim. Review it, then send it yourself.',
+          r2_label: 'Review the claim',
+          unconfirmed: false,
+          claims: { booking: `You have a booking for ${trip}`, delay: `${trip} is delayed ${length}` },
+        };
+      } else {
+        const product = str(d['product'], 'this item');
+        copy = {
+          title: `${product} dropped ${usd(num(d['drop_cents']))} — you may be owed a price adjustment`,
+          why: `You paid ${usd(num(d['purchase_cents']))}, and the price fell inside your return window, which ends ${shortDate(str(d['window_ends']))}. A request is drafted from your receipt and the price notice.`,
+          r2_label: 'Review the claim',
+          unconfirmed: false,
+          claims: { purchase: `You bought ${product} for ${usd(num(d['purchase_cents']))}`, drop: `The price of ${product} fell by ${usd(num(d['drop_cents']))}` },
+        };
+      }
+      break;
+    }
+    case 'T_FAMILY_EVENT_AUTOPILOT': {
+      const event = str(d['event'], 'An event');
+      const items = Array.isArray(d['checklist']) ? (d['checklist'] as unknown[]).filter((x): x is string => typeof x === 'string' && x.trim() !== '') : [];
+      const on = shortDate(str(d['registration_opens_on']));
+      copy = {
+        title: `${event}: registration opens ${on}`,
+        why: items.length === 0 ? 'Put the date on your radar so the spots do not go without you.' : `Have these ready: ${items.join('; ')}.`,
+        r2_label: 'Mark as handled',
+        unconfirmed: false,
+        claims: { plan: items.length === 0 ? `Registration for ${event} opens on ${on}` : `Registration for ${event} opens on ${on} and asks for: ${items.join('; ')}` },
       };
       break;
     }

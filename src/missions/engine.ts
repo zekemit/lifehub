@@ -11,9 +11,12 @@
  *   - stages at most HOME_CAPACITY active cards per household, choosing a diverse set first (credit, fee, then the
  *     flagship / subscription card) and filling the rest by score = recoverable_cents * confidence * urgency.
  * Staged runs are R1_STAGED: private, nothing is sent, nothing is debited. Approval (R2) and links (R3) belong to MissionRunWF.
+ *
+ * A trigger's rows normally stage the trigger's own template. A row may instead return a `template_key` column naming another stored
+ * template, so one trigger can stage a 1-credit card for one situation and a 3-credit card for another (T_CLOSING_RETURN_OR_WARRANTY).
  */
 
-import { buildCopy, UNLOCK_SCAN_COPY, type CardCopy } from './copy';
+import { buildCopy, TaxLanguageError, UNLOCK_SCAN_COPY, type CardCopy } from './copy';
 
 export const HOME_CAPACITY = 3;
 export const ACTIVE_STATES = ['R1_STAGED', 'R2_AWAITING', 'R2_APPROVED', 'R3_LINK_ISSUED'] as const;
@@ -92,6 +95,7 @@ export async function evaluateTrigger(
     .all<Record<string, unknown>>();
   const candidates: Candidate[] = [];
   let malformed = 0;
+  let known: Set<string> | null = null;
   for (const row of results.slice(0, MAX_ROWS_PER_TRIGGER)) {
     const dedupe = row['dedupe_key'];
     const recoverable = Number(row['recoverable_cents']);
@@ -106,11 +110,22 @@ export async function evaluateTrigger(
       malformed += 1;
       continue;
     }
+    // A row may name the template it wants (one trigger, several credit weights); it must be a stored template, or the row is malformed.
+    const wanted = row['template_key'];
+    let template_key = trigger.template_key;
+    if (typeof wanted === 'string' && wanted !== '' && wanted !== trigger.template_key) {
+      known ??= new Set((await db.prepare('SELECT DISTINCT template_key FROM mission_templates').all<{ template_key: string }>()).results.map((r) => r.template_key));
+      if (!known.has(wanted)) {
+        malformed += 1;
+        continue;
+      }
+      template_key = wanted;
+    }
     const u = Math.min(1, Math.max(0, urgency));
     const c = Math.min(1, Math.max(0, confidence));
     candidates.push({
       trigger_key: trigger.trigger_key,
-      template_key: trigger.template_key,
+      template_key,
       cooldown_days: trigger.cooldown_days,
       dedupe_key: dedupe,
       recoverable_cents: Math.round(recoverable),
@@ -366,8 +381,8 @@ export async function insertRun(
 
 export type StageOutcome = { staged: true; run_id: string } | { staged: false; reason: string };
 
-/** Gates G9 -> G1 -> G7, then stage. Writes an audit row when a candidate is rejected for grounding. */
-export async function stageCandidate(db: D1Database, household_id: string, c: Candidate, now: Date): Promise<StageOutcome> {
+/** Gates G9 -> G1 -> G7, then stage. Writes an audit row when a candidate is rejected for grounding or for tax language. */
+export async function stageCandidate(db: D1Database, household_id: string, c: Candidate, now: Date, o: { origin?: 'trigger' | 'user' } = {}): Promise<StageOutcome> {
   if (await isBlockedByCooldown(db, household_id, c, now)) return { staged: false, reason: 'cooldown' };
   const grounded = await groundClaims(db, household_id, c.claims);
   if (!grounded.ok) {
@@ -377,8 +392,20 @@ export async function stageCandidate(db: D1Database, household_id: string, c: Ca
       .run();
     return { staged: false, reason: 'ungrounded' };
   }
-  const copy = buildCopy(c.trigger_key, c.data);
-  const run_id = await insertRun(db, household_id, { ...c, copy, claims: grounded.claims, now });
+  // Card copy is built from names and phrases that came out of the member's own mail (a product, a checklist item). If one of them reads as tax
+  // characterization (Gate G7), that card is not staged; it must never abort the sweep that was staging the household's other cards.
+  let copy: CardCopy;
+  try {
+    copy = buildCopy(c.trigger_key, c.data);
+  } catch (err) {
+    if (!(err instanceof TaxLanguageError)) throw err;
+    await db
+      .prepare(`INSERT INTO audit_log (id, household_id, actor, action, detail_json, created_at) VALUES (?, ?, 'mission-engine', 'mission_tax_language', ?, ?)`)
+      .bind(newId('aud'), household_id, JSON.stringify({ trigger_key: c.trigger_key, dedupe_key: c.dedupe_key }), now.toISOString())
+      .run();
+    return { staged: false, reason: 'tax_language' };
+  }
+  const run_id = await insertRun(db, household_id, { ...c, copy, claims: grounded.claims, now, ...(o.origin === undefined ? {} : { origin: o.origin }) });
   return { staged: true, run_id };
 }
 
