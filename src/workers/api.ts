@@ -10,6 +10,7 @@
  *   GET  /api/auth/google/login, /api/auth/google/callback   public: Google sign-in (src/workers/auth.ts).
  *   GET  /api/auth/me, POST /api/auth/logout
  *   POST /api/missions/<run_id>/(start|approve|decline|confirm), POST /api/push/subscribe   (src/workers/missions.ts)
+ *   GET  /api/inbox/setup, POST /api/inbox/sync, POST /api/claims/warranty   (src/workers/inbox.ts)
  *
  * Authentication (every route except the two sign-in routes): the sealed __Host-session cookie set by the Google callback, or
  * `Authorization: Bearer <session token>` (src/workers/session.ts); the member must still belong to a live household. Cookie-authenticated
@@ -26,6 +27,7 @@ import { authenticate, handleGoogleCallback, handleGoogleLogin, handleLogout, ha
 import { error, isAlreadyExists, json } from './http';
 import { handleAutoRecharge, handleBalance, handleCheckout } from './billing';
 import { handleConciergeAction, handleCreateAlarm, handleCreateWatch, parseConciergePath } from './concierge';
+import { handleInboxSetup, handleInboxSync, handleWarrantyClaim } from './inbox';
 import { handleMission, handlePushSubscribe, parseMissionPath } from './missions';
 import { handleReceiptGenerate, handleReceiptLatest, handleShareCard } from './receipt';
 
@@ -129,6 +131,9 @@ const ROUTES: Readonly<Record<string, string>> = {
   '/api/receipt/share-card.svg': 'GET',
   '/api/drop-alarms': 'POST',
   '/api/price-watches': 'POST',
+  '/api/inbox/setup': 'GET',
+  '/api/inbox/sync': 'POST',
+  '/api/claims/warranty': 'POST',
 };
 /** No session: Google's sign-in redirects, and Stripe's webhook (authenticated by its signature, not a cookie, so no CSRF check either). */
 const PUBLIC_ROUTES: Readonly<Record<string, string>> = { '/api/auth/google/login': 'GET', '/api/auth/google/callback': 'GET', '/api/webhooks/stripe': 'POST' };
@@ -187,6 +192,12 @@ export async function handleApi(request: Request, env: Env, deps: { now?: () => 
       return handleCreateAlarm(request, env, auth, now);
     case '/api/price-watches':
       return handleCreateWatch(request, env, auth, now);
+    case '/api/inbox/setup':
+      return handleInboxSetup(env, auth);
+    case '/api/inbox/sync':
+      return handleInboxSync(env, auth, { fetch: network, now: nowFn });
+    case '/api/claims/warranty':
+      return handleWarrantyClaim(request, env, auth, now);
     default:
       return json(200, await getHome(env.DB, auth.household_id, now));
   }

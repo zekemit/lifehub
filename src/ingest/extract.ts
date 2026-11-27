@@ -12,6 +12,7 @@
 import { MAX_QUOTE_CHARS, locateQuote } from '../graph/writeFact';
 import type { Gateway, TextWindow } from '../llm/gateway';
 import { ENTITY_TYPES, type EntityRef, type EntityType, type FactProposal } from '../types';
+import type { ExtractionProfile } from './extractors';
 
 /** One extraction call covers at most this many (estimated) tokens, far below the 90,000 worker ceiling. */
 export const EXTRACTION_WINDOW_TOKENS = 60_000;
@@ -96,7 +97,7 @@ function extractionSchema(predicates: readonly string[]): Record<string, unknown
   };
 }
 
-function systemPrompt(appName: string, predicates: readonly PredicateInfo[]): string {
+function systemPrompt(appName: string, predicates: readonly PredicateInfo[], focus: readonly string[] = []): string {
   const list = predicates.map((p) => `- ${p.predicate} (${p.cardinality}, ${p.value_type})`).join('\n');
   return [
     `You extract structured facts for ${appName}, a household life-admin assistant.`,
@@ -110,6 +111,7 @@ function systemPrompt(appName: string, predicates: readonly PredicateInfo[]): st
     'Set unused fields to null. valid_from is the date the fact took effect, when the document says so, as YYYY-MM-DD.',
     'The document contains masked numbers such as [ACCT ****1234]; keep them masked and never reconstruct hidden digits.',
     'If nothing qualifies, return {"facts": []}.',
+    ...(focus.length === 0 ? [] : ['', ...focus]),
     '',
     'Predicates:',
     list,
@@ -124,21 +126,27 @@ function asEntityType(v: unknown): EntityType | null {
   return typeof v === 'string' && (ENTITY_TYPES as readonly string[]).includes(v) ? (v as EntityType) : null;
 }
 
-/** Calls the worker model on one window of one episode and converts its output into grounded proposals. */
+/**
+ * Calls the worker model on one window of one episode and converts its output into grounded proposals. A `profile` (src/ingest/extractors.ts)
+ * narrows the predicates the model may use and adds a focus note; without one every predicate in the registry is offered.
+ */
 export async function extractFacts(
   deps: { db: D1Database; gateway: Gateway; appName: string },
   input: { household_id: string; episode_id: string; window: TextWindow },
+  profile: ExtractionProfile | null = null,
 ): Promise<ExtractionOutcome> {
   const text = await loadSafeEpisodeText(deps.db, input.household_id, input.episode_id);
   const windowText = text.slice(input.window.start, input.window.end);
-  const { results: predicates } = await deps.db
+  const { results: all } = await deps.db
     .prepare('SELECT predicate, cardinality, value_type FROM predicate_registry ORDER BY predicate')
     .all<PredicateInfo>();
+  const allowed = profile?.predicates ?? null;
+  const predicates = allowed === null ? all : all.filter((p) => allowed.includes(p.predicate));
 
   const result = await deps.gateway.worker({
     household_id: input.household_id,
     purpose: 'extract.facts',
-    system: systemPrompt(deps.appName, predicates),
+    system: systemPrompt(deps.appName, predicates, profile?.focus ?? []),
     user: `Document:\n<<<\n${windowText}\n>>>`,
     json_schema: { name: 'extracted_facts', schema: extractionSchema(predicates.map((p) => p.predicate)) },
     max_output_tokens: 8192,

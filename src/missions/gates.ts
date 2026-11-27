@@ -74,7 +74,7 @@ export interface CardPayload {
   template_key: string;
   trigger_key: string;
   dedupe_key: string;
-  kind: 'use_credit' | 'retention_script' | 'dinner_plan' | 'cancel_script' | 'plan' | 'drop_alarm' | 'flight_deal';
+  kind: 'use_credit' | 'retention_script' | 'dinner_plan' | 'cancel_script' | 'plan' | 'drop_alarm' | 'flight_deal' | 'return_deadline' | 'claim_packet' | 'event_checklist';
   copy: CardCopy;
   /** Model-written script text (retention / cancel calls). Assistive only, never a claim. */
   script: string | null;

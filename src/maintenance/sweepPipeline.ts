@@ -18,17 +18,15 @@ import { decayFacts } from './decay';
 import {
   FALLBACK_TRIGGERS,
   HOME_CAPACITY,
-  UnsafeTriggerSqlError,
   activeStagedCount,
-  evaluateTrigger,
   expireStaleRuns,
-  isBlockedByCooldown,
-  loadTriggers,
   orderCandidates,
-  stageCandidate,
   stageUnlockScan,
   type Candidate,
 } from '../missions/engine';
+import { eligibleCandidates, stageInOrder, type StagedCard } from '../missions/triggers';
+
+export type { StagedCard };
 
 export interface SweepDeps {
   db: D1Database;
@@ -36,68 +34,11 @@ export interface SweepDeps {
   now: () => Date;
 }
 
-export interface StagedCard {
-  trigger_key: string;
-  run_id: string;
-  score: number;
-}
-
 export interface SweepResult {
   decay: { closed: number; examined: number };
   recompute: { credit_periods: number; envelopes: number };
   triggers: { evaluated: number; suppressed: number; ungrounded: number; staged: StagedCard[]; expired: number };
   cold_start: { staged: StagedCard[]; unlock_scan: boolean };
-}
-
-const newAudit = (): string => `aud_${crypto.randomUUID().replace(/-/g, '')}`;
-
-/** Evaluates the given triggers and returns the candidates that are not blocked by cooldown or an active duplicate. */
-async function eligibleCandidates(
-  db: D1Database,
-  household_id: string,
-  keys: (key: string) => boolean,
-  now: Date,
-): Promise<{ eligible: Candidate[]; evaluated: number; suppressed: number }> {
-  const eligible: Candidate[] = [];
-  let evaluated = 0;
-  let suppressed = 0;
-  for (const trigger of (await loadTriggers(db)).filter((t) => keys(t.trigger_key))) {
-    let found: Candidate[];
-    try {
-      found = (await evaluateTrigger(db, household_id, trigger, now)).candidates;
-    } catch (err) {
-      if (!(err instanceof UnsafeTriggerSqlError)) throw err;
-      await db
-        .prepare(`INSERT INTO audit_log (id, household_id, actor, action, detail_json, created_at) VALUES (?, ?, 'mission-engine', 'trigger_rejected', ?, ?)`)
-        .bind(newAudit(), household_id, JSON.stringify({ trigger_key: trigger.trigger_key, reason: err.message }), now.toISOString())
-        .run();
-      continue;
-    }
-    evaluated += found.length;
-    for (const c of found) {
-      if (await isBlockedByCooldown(db, household_id, c, now)) suppressed += 1;
-      else eligible.push(c);
-    }
-  }
-  return { eligible, evaluated, suppressed };
-}
-
-async function stageInOrder(
-  db: D1Database,
-  household_id: string,
-  ordered: readonly Candidate[],
-  capacity: number,
-  now: Date,
-): Promise<{ staged: StagedCard[]; ungrounded: number }> {
-  const staged: StagedCard[] = [];
-  let ungrounded = 0;
-  for (const c of ordered) {
-    if (staged.length >= capacity) break;
-    const outcome = await stageCandidate(db, household_id, c, now);
-    if (outcome.staged) staged.push({ trigger_key: c.trigger_key, run_id: outcome.run_id, score: c.score });
-    else if (outcome.reason === 'ungrounded') ungrounded += 1;
-  }
-  return { staged, ungrounded };
 }
 
 export async function runNightlySweep(deps: SweepDeps, params: NightlySweepParams, step: StepLike): Promise<SweepResult> {

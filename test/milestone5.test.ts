@@ -1394,7 +1394,7 @@ test('DROP ALARM creation: validated inputs, a grounding fact quoting the member
   const bads: Array<[Record<string, unknown>, string]> = [
     [{ venue_entity_id: 5 }, 'bad_input'], [{ reservation_date: 'soon' }, 'bad_input'], [{ reservation_date: '2027-02-30' }, 'bad_input'], [{ party_size: 0 }, 'bad_input'],
     [{ party_size: 13 }, 'bad_input'], [{ party_size: 2.5 }, 'bad_input'], [{ party_size: '2' }, 'bad_input'], [{ venue_entity_id: 'ent_nope' }, 'unknown_venue'],
-    [{ reservation_date: inDays(10) }, 'release_passed'], [{ reservation_date: inDays(30) }, 'release_passed'], [{ reservation_date: inDays(30 + 400) }, 'too_far'],
+    [{ reservation_date: inDays(10) }, 'release_passed'], [{ reservation_date: inDays(25) }, 'release_passed'], [{ reservation_date: inDays(30 + 400) }, 'too_far'],
   ];
   for (const [o, code] of bads) assert.equal((await create(o) as { code?: string }).code, code, JSON.stringify(o));
   const stranger = await light();

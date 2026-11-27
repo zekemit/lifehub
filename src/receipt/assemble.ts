@@ -93,16 +93,21 @@ export async function assembleReceipt(db: D1Database, household_id: string, time
   }
   const returns = await db
     .prepare(
-      `SELECT w.fact_id AS window_fact, w.value_text AS ends_on, e.canonical_name AS subject, a.fact_id AS amount_fact, a.value_cents AS cents
+      // the window and the amount may be the M5 pair (return_window_ends_on + return_eligible_cents) or the pair the M6 email extractors write
+      // (return_window_closes_on + purchase_price_cents); a product that has both is listed once
+      `SELECT w.fact_id AS window_fact, w.subject_id AS subject_id, w.value_text AS ends_on, e.canonical_name AS subject, a.fact_id AS amount_fact, a.value_cents AS cents
          FROM facts_current w
          JOIN entities e ON e.entity_id = w.subject_id
-         JOIN facts_current a ON a.household_id = w.household_id AND a.subject_id = w.subject_id AND a.predicate = 'return_eligible_cents'
-        WHERE w.household_id = ?1 AND w.predicate = 'return_window_ends_on' AND w.value_text >= ?2 AND w.value_text <= date(?2, '+14 days')
-        ORDER BY w.value_text, w.fact_id LIMIT 5`,
+         JOIN facts_current a ON a.household_id = w.household_id AND a.subject_id = w.subject_id AND a.predicate IN ('return_eligible_cents', 'purchase_price_cents')
+        WHERE w.household_id = ?1 AND w.predicate IN ('return_window_ends_on', 'return_window_closes_on') AND w.value_text >= ?2 AND w.value_text <= date(?2, '+14 days')
+        ORDER BY w.value_text, w.fact_id, CASE a.predicate WHEN 'return_eligible_cents' THEN 0 ELSE 1 END LIMIT 10`,
     )
     .bind(household_id, today)
-    .all<{ window_fact: string; ends_on: string; subject: string; amount_fact: string; cents: number }>();
+    .all<{ window_fact: string; subject_id: string; ends_on: string; subject: string; amount_fact: string; cents: number }>();
+  const listed = new Set<string>();
   for (const r of returns.results) {
+    if (listed.has(r.subject_id) || listed.size >= 5) continue;
+    listed.add(r.subject_id);
     const text = `The return window for ${r.subject} closes ${shortDate(r.ends_on)} — ${usd(r.cents)} is still returnable`;
     found.push({ text, cents: r.cents, claim_id: claim(text, [r.window_fact, r.amount_fact]) });
   }

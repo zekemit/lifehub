@@ -6,16 +6,22 @@
  *   2. size cap 25 MiB (larger => reject with a "please upload" message);
  *   3. accept only if the TOPMOST Authentication-Results header shows spf=pass or dkim=pass, OR the SMTP sender is one
  *      of the household's member emails; otherwise setReject();
- *   4. raw MIME is encrypted into R2 (per-household AES-GCM DEK wrapped by the KEK) — plaintext is never stored;
- *   5. an IngestEmailWF instance (id = episode id) does the rest: parse, redact, extract, write facts.
- * Duplicate deliveries (same sha256) are accepted silently and processed once.
+ *   4. the inbox funnel's first three layers (src/ingest/inboxTriage.ts), before anything is written to R2 or any model is called:
+ *        L0 a message already claimed by either channel (auto-forward OR Gmail sync) is a duplicate and stops here;
+ *        L1 bulk mail with no transactional tokens is dropped and counted;
+ *        L2 a Gmail / Outlook / iCloud forwarding confirmation is captured for the member and stops here;
+ *   5. raw MIME is encrypted into R2 (per-household AES-GCM DEK wrapped by the KEK) — plaintext is never stored;
+ *   6. an IngestEmailWF instance (id = episode id) does the rest: parse, redact, classify (L3), extract, write facts.
+ * Duplicate deliveries (same Message-ID, or the same sha256) are accepted silently and processed once.
  *
  * Authentication-Results trust: the topmost header is the one prepended by the last hop before this Worker
  * (Cloudflare's MX). Headers further down are sender-controlled and are ignored.
  */
 
-import { putEncrypted, objectExists, sha256Hex } from '../crypto/vault';
-import type { Env, IngestEmailParams } from '../types';
+import { sha256Hex } from '../crypto/vault';
+import { handOff } from '../ingest/handoff';
+import { admitInbound, parseInbound, type ForwardingProvider, type InboundMail } from '../ingest/inboxTriage';
+import type { Env } from '../types';
 
 export const MAX_EMAIL_BYTES = 25 * 1024 * 1024;
 const ALIAS_LOCAL = /^h_[a-z2-7]{10}$/;
@@ -32,6 +38,10 @@ export interface InboundMessage {
 export type EmailOutcome =
   | { status: 'rejected'; reason: string }
   | { status: 'duplicate'; episode_id: string }
+  /** Layer 1: bulk mail with no transactional content. Nothing was stored. */
+  | { status: 'dropped_bulk'; signals: string[] }
+  /** Layer 2: an auto-forward confirmation, captured for the member. Nothing was stored. */
+  | { status: 'forwarding_confirmation'; provider: ForwardingProvider }
   | { status: 'accepted'; episode_id: string; instance_id: string };
 
 /** Returns the alias local part ('h_xxxxxxxxxx') if `to` is a drop address on `inboundDomain`, else null. */
@@ -76,6 +86,7 @@ async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> 
 export async function handleEmail(
   message: InboundMessage,
   env: Env,
+  deps: { now?: () => Date } = {},
 ): Promise<EmailOutcome> {
   const reject = (reason: string): EmailOutcome => {
     message.setReject(reason);
@@ -108,26 +119,26 @@ export async function handleEmail(
     if (member === null) return reject('Sender could not be verified for this address');
   }
 
-  // 4. Identify, dedupe, encrypt at rest.
+  // 4. Identify, then the funnel's Layers 0-2 (no R2 write and no model call happens before this point is passed).
   const sha256 = await sha256Hex(raw);
   const episode_id = `ep_${(await sha256Hex(`${household_id}:${sha256}`)).slice(0, 32)}`;
-  const existing = await env.DB.prepare('SELECT episode_id FROM episodes WHERE household_id = ? AND sha256 = ?')
-    .bind(household_id, sha256)
-    .first<{ episode_id: string }>();
-  if (existing !== null) return { status: 'duplicate', episode_id: existing.episode_id };
-
-  const r2_key = `raw/${household_id}/${sha256}.eml.enc`;
-  if (!(await objectExists(env, r2_key))) await putEncrypted(env, household_id, r2_key, raw);
-
-  // 5. Hand off to the durable pipeline.
-  const params: IngestEmailParams = { household_id, r2_key, sha256, size_bytes: raw.length, envelope_from: envelopeFrom };
+  let claimed: string | null = null;
+  let mail: InboundMail | null = null;
   try {
-    await env.INGEST_EMAIL_WF.create({ id: episode_id, params });
-  } catch (err) {
-    if (/already|exist/i.test(err instanceof Error ? err.message : String(err))) {
-      return { status: 'duplicate', episode_id };
-    }
-    throw err;
+    mail = await parseInbound(raw);
+  } catch {
+    mail = null; // an unparseable message skips the funnel; the pipeline will deal with it as before
   }
+  if (mail !== null) {
+    const admission = await admitInbound(env.DB, household_id, 'email_forward', mail, { now: (deps.now ?? (() => new Date()))(), episode_id });
+    if (admission.action === 'duplicate') return { status: 'duplicate', episode_id: admission.episode_id ?? episode_id };
+    if (admission.action === 'dropped_bulk') return { status: 'dropped_bulk', signals: admission.signals };
+    if (admission.action === 'forwarding_confirmation') return { status: 'forwarding_confirmation', provider: admission.provider };
+    claimed = admission.message_id_norm;
+  }
+
+  // 5. Dedupe on the raw bytes, encrypt at rest, hand off (a failure after the claim gives the claim back).
+  const handed = await handOff(env, { household_id, raw, sha256, episode_id, envelope_from: envelopeFrom, claimed, channel: 'email_forward' });
+  if (handed.status === 'duplicate') return { status: 'duplicate', episode_id: handed.episode_id };
   return { status: 'accepted', episode_id, instance_id: episode_id };
 }
