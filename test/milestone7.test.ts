@@ -821,14 +821,17 @@ test('INSUFFICIENT_CREDITS: the goal halts with nothing taken; after a top-up th
 
   const rig2 = goalRig(rt, h, { goal_id: id, attempt: 1 });
   Object.assign(rig2.params, rig.workflows.goal[1]!.params);
+  const seenRetry: Record<string, unknown> = {};
   const done = await runToEnd(rig2, async () => {
-    assert.equal(rig.workflows.goalEvents.length, 0);
+    seenRetry['eventsBefore'] = rig.workflows.goalEvents.length;
     const row = await goalRow(id);
+    seenRetry['errorCode'] = row['error_code'];
     const ok = await api(rig.env, `/api/goals/${id}/approve`, h, { body: { approval_hash: row['approval_hash'] } });
-    assert.equal(ok.status, 202);
-    assert.equal(rig.workflows.goalEvents.at(-1)!.id, `${id}~1`, 'the approval goes to the newest instance');
+    seenRetry['approve'] = ok.status;
+    seenRetry['instance'] = rig.workflows.goalEvents.at(-1)?.id;
     return rig.workflows.goalEvents.at(-1)!.payload;
   }, rt);
+  assert.deepEqual(seenRetry, { eventsBefore: 0, errorCode: null, approve: 202, instance: `${id}~1` }, 'the halt is cleared before the run, and the approval goes to the newest instance');
   assert.equal(done.outcome.status, 'completed');
   assert.deepEqual((await ledgerOf(id)).map((e) => e.delta), [-5], 'charged once');
   assert.equal(rig2.model.count('GOAL-PLANNER'), 1);
@@ -1291,6 +1294,7 @@ test('SOURCE: no brand or inbound domain in src; the new files make no direct fe
     const code = strip(readFileSync(join(root, f), 'utf8')).replace(/(?:deps|ctx)\.fetch\(/g, '').replace(/'Rules: no eval[^\n]*'/, '');
     assert.ok(!/(?<![.\w])fetch\s*\(/.test(code), `${f} calls the network only through the guarded fetch it is given`);
   }
+  assert.match(readFileSync(join(root, 'src/workflows/goalExecutionWF.ts'), 'utf8'), /runGoal\(step as unknown as StepLike, deps, \{ \.\.\.event\.payload, goal_id \}\)/, 'the Workflow hands the payload over unchanged');
   assert.match(readFileSync(join(root, 'src/index.ts'), 'utf8'), /export \{ GoalExecutionWF \} from '\.\/workflows\/goalExecutionWF';/);
   const toml = readFileSync(join(root, 'wrangler.toml'), 'utf8');
   assert.match(toml, /name = "goal-execution"\s*\nbinding = "GOAL_EXECUTION_WF"\s*\nclass_name = "GoalExecutionWF"/);
@@ -1531,9 +1535,10 @@ test('PLAN DAG/SLUG (more): notes are clipped to 400 characters; accents fold', 
 test('PIPELINE (more): long titles are clipped, a raw request is redacted again, own-household paths pass, the manifest cap is kept, base urls are normalized', async () => {
   const h = await makeHousehold(rt.db);
   await fund(h, 30);
-  const long = await runGoalCase(h, { script: { plan: { title: 'T'.repeat(200), slug: 'long-title-book', summary: 's', tasks: [] } } });
+  const long = await runGoalCase(h, { script: { plan: { title: 'T'.repeat(200), slug: 'long-title-book', summary: 's'.repeat(700), tasks: [] } } });
   assert.equal(long.outcome.status, 'completed');
   assert.equal((await fx.one<{ t: string }>('SELECT title AS t FROM micro_apps WHERE goal_id = ?', long.id)).t.length, 80);
+  assert.equal(JSON.parse((await fx.one<{ o: string }>(`SELECT output_json AS o FROM goal_tasks WHERE goal_id = ? AND kind = 'decompose'`, long.id)).o).summary.length, 600);
 
   const raw = await runGoalCase(h, { prompt: 'Build me a recipe app for card 4111 1111 1111 1111 holders' });
   assert.equal(raw.outcome.status, 'completed');
@@ -1654,6 +1659,15 @@ test('PLANNER OUTPUT: a title or note the redactor would change never reaches a 
   assert.ok(!(await fx.one<{ s: string }>(`SELECT group_concat(spec_json) AS s FROM goal_tasks WHERE goal_id = ?`, r.id)).s.includes('4111'));
 });
 
+test('PLANNER OUTPUT (more): a planner that answers with the wrong types still gets a safe title, summary and the canonical DAG', async () => {
+  const h = await makeHousehold(rt.db);
+  await fund(h, 5);
+  const r = await runGoalCase(h, { script: { plan: { title: 42, slug: 7, summary: null, tasks: 'later' } } });
+  assert.equal(r.outcome.status, 'completed', JSON.stringify(r.outcome));
+  const plan = JSON.parse((await fx.one<{ output_json: string }>(`SELECT output_json FROM goal_tasks WHERE goal_id = ? AND kind = 'decompose'`, r.id)).output_json);
+  assert.deepEqual([plan.title, plan.summary, plan.dag_source], ['Household app', '', 'canonical']);
+});
+
 test('CONTEXT (more): another household\'s spouse is never used', async () => {
   const other = await makeHousehold(rt.db);
   const text = 'Zed is married to Quinn.';
@@ -1670,13 +1684,16 @@ test('API (more): approve and decline send goal_approval events; a halted goal f
   await fund(h, 5);
   const rig = goalRig(rt, h);
   await createViaApi(rig, h, WIFE_PROMPT);
+  const seenEvent: Record<string, unknown> = {};
   await runToEnd(rig, async () => {
     const row = await goalRow(rig.params.goal_id);
     await api(rig.env, `/api/goals/${rig.params.goal_id}/approve`, h, { body: { approval_hash: row['approval_hash'] } });
-    assert.equal(rig.workflows.goalEvents.at(-1)!.type, `goal_approval:${rig.params.goal_id}`);
-    assert.deepEqual(Object.keys(rig.workflows.goalEvents.at(-1)!.payload as object).sort(), ['approval_hash', 'decision', 'member_id']);
-    return rig.workflows.goalEvents.at(-1)!.payload;
+    const ev = rig.workflows.goalEvents.at(-1);
+    seenEvent['type'] = ev?.type;
+    seenEvent['keys'] = Object.keys((ev?.payload ?? {}) as object).sort();
+    return ev!.payload;
   }, rt);
+  assert.deepEqual(seenEvent, { type: `goal_approval:${rig.params.goal_id}`, keys: ['approval_hash', 'decision', 'member_id'] });
 
   const optIn = await makeHousehold(rt.db);
   await rt.db.prepare(`UPDATE households SET stripe_customer_id = 'cus_x', stripe_default_payment_method_id = 'pm_x', auto_recharge_enabled = 1, auto_recharge_pack_sku = 'pack_10', auto_recharge_monthly_cap_cents = 2000 WHERE household_id = ?`).bind(optIn.household_id).run();
