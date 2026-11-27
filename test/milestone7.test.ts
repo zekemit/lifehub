@@ -340,10 +340,10 @@ const HH = 'hh_testhouse';
 const BLOCK = ['resy.com', 'opentable.com', 'tock.com', 'sevenrooms.com', 'api.monarch.com'];
 const verify = (b: unknown, slug?: string) => verifyBundle(b, { household_id: HH, blocklist: BLOCK, ...(slug === undefined ? {} : { slug }) });
 const codes = (b: unknown, slug?: string): string[] => [...new Set(verify(b, slug).diagnostics.map((d) => d.code))].sort();
-const html = (f: (h: string) => string) => (): Bundle => ({ ...REF(), html: f(REF().html) });
+const html = (f: (h: string) => string) => (slug: string = SLUG, title?: string): Bundle => ({ ...REF(slug, title), html: f(REF(slug, title).html) });
 const inject = (snippet: string) => html((h) => h.replace('</body>', `${snippet}</body>`));
-const manifest = (f: (m: any) => void) => (): Bundle => {
-  const b = structuredClone(REF());
+const manifest = (f: (m: any) => void) => (slug: string = SLUG, title?: string): Bundle => {
+  const b = structuredClone(REF(slug, title));
   f(b.manifest);
   return b;
 };
@@ -1432,4 +1432,351 @@ test('STAGE REGATE: a deliverable that stops passing between verification and st
   assert.equal((await rt.bucket.list({ prefix: `apps/${h.household_id}/` })).objects.length, 0);
   assert.deepEqual(await appsOf(rig.params.goal_id), []);
   assert.equal((await buckets(h)).total, 5);
+});
+
+// ═══════════════ tightening: the guards the mutation pass found untested ═══════════════
+
+import { PARSE_TOKEN_CAP, INSTALL_TOKEN_TTL_SECONDS, PREVIEW_TOKEN_TTL_SECONDS, MAX_PARSE_TEXT_CHARS } from '../src/builder/microAppRuntime';
+import { MAX_QUERY_WORDS, brokenRestrictions, heuristicParse, normalizeParsed, queryWords, restrictionKey, searchTokens, suggestMeals, tagToken, words } from '../src/builder/recipeLogic';
+import { canonicalJson } from '../src/missions/runPipeline';
+import { sha256Hex } from '../src/crypto/vault';
+import { estimateTokens } from '../src/llm/gateway';
+import { GMAIL_SCOPE as _GS } from '../src/connectors/gmailSync';
+
+const FORBIDDEN_MORE: Array<[string, string, () => Bundle]> = [
+  ['EventSource', 'WEBSOCKET', inject('<script>new EventSource("api/search")</script>')],
+  ['static import', 'DYNAMIC_IMPORT', inject('<script type="module">import x from "./a.js";</script>')],
+  ['window.open', 'NAVIGATION', inject('<script>window.open("api/search")</script>')],
+  ['postMessage', 'NAVIGATION', inject('<script>parent2.postMessage("x", "*")</script>')],
+  ['window.top', 'NAVIGATION', inject('<script>var t = window.top;</script>')],
+  ['window.parent', 'NAVIGATION', inject('<script>var t = window.parent;</script>')],
+  ['constructor chain without a string', 'CONSTRUCTOR_CHAIN', inject('<script>var f = [].constructor.constructor; f(x)</script>')],
+  ['constructor( with a string', 'CONSTRUCTOR_CHAIN', inject('<script>var f = constructor("return 1");</script>')],
+  ['an upper-case blocked host', 'BLOCKLISTED_ORIGIN', inject('<p>RESY.COM</p>')],
+  ['another household path without an id prefix', 'CROSS_TENANT', inject('<a href="/apps/neighbours/recipe-book">x</a>')],
+  ['an unlabelled search box', 'A11Y_LABEL', html((h) => h.replace(' aria-label="Search recipes by ingredient, title or tag"', ''))],
+  ['a huge page', 'TOO_LARGE', html((h) => h + `<!-- ${'x'.repeat(130_000)} -->`)],
+  ['a huge manifest', 'TOO_LARGE', manifest((m) => (m.description = 'x'.repeat(9_000)))],
+];
+for (const [name, code, make] of FORBIDDEN_MORE) {
+  test(`VERIFIER (more) rejects ${name} (${code})`, () => {
+    const found = codes(make(), SLUG);
+    assert.ok(found.includes(code), `${code} expected, got ${found.join(', ') || 'nothing'}`);
+  });
+}
+
+test('VERIFIER (more): formatting keeps the location; a plan that is an array or null is not a plan; the apps own household path is allowed', () => {
+  assert.match(formatDiagnostics([{ code: 'X', message: 'm', where: 'here' }, { code: 'Y', message: 'n' }]), /^- \[X\] m \(at: here\)\n- \[Y\] n$/);
+  assert.equal(verifyPlan([]).ok, false);
+  assert.equal(verifyPlan(null).ok, false);
+  const own = verifyBundle(inject(`<a href="/apps/${HH}/${SLUG}/preview">preview</a>`)(), { household_id: HH, blocklist: BLOCK, slug: SLUG });
+  assert.deepEqual(own.diagnostics, [], 'the app may name its own household path');
+});
+
+test('PACKAGER/TOKENS: the iframe allows the camera; token lifetimes are 1 day (preview) and 365 days (install)', async () => {
+  const art = buildInstallArtifact({ base_url: 'https://app.example', household_id: HH, slug: SLUG, title: 'T', install_token: 'tok', target_domain: null });
+  assert.ok(art.embed_snippet.iframe.includes(' allow="camera" '));
+  assert.ok(art.embed_snippet.web_component.includes("setAttribute('allow', 'camera')"));
+  assert.equal(PREVIEW_TOKEN_TTL_SECONDS, 86_400);
+  assert.equal(INSTALL_TOKEN_TTL_SECONDS, 365 * 86_400);
+  assert.equal(PARSE_TOKEN_CAP, 4_000);
+  assert.ok(estimateTokens('x'.repeat(MAX_PARSE_TEXT_CHARS)) + 400 < PARSE_TOKEN_CAP, 'the token cap is a backstop the character limit already keeps well inside');
+});
+
+test('RECIPE LOGIC: words, folding, caps, restrictions, parsing limits and suggestion order', () => {
+  assert.deepEqual(words('a b Crème-Brûlée 7'), ['creme', 'brulee']);
+  assert.deepEqual(words('A b'), []);
+  assert.equal(queryWords(Array.from({ length: 20 }, (_, i) => `word${i}`).join(' ')).length, MAX_QUERY_WORDS);
+  assert.equal(MAX_QUERY_WORDS, 8);
+  assert.equal(tagToken('Gluten Free!'), '#gluten-free');
+  const many = searchTokens({ title: 'x', ingredients: Array.from({ length: 400 }, (_, i) => `ing${i}`), tags: [] });
+  assert.equal(many.trim().split(' ').length, 300);
+  assert.deepEqual(brokenRestrictions(['wheat flour'], 'Cake', ['gluten-free', 'vegan']), ['gluten-free']);
+  assert.deepEqual(brokenRestrictions(['rice noodles', 'shrimp'], 'Pad Thai', ['gluten-free']), [], 'rice noodles are not gluten');
+  assert.deepEqual(brokenRestrictions(['glass noodles'], 'x', ['gluten-free']), []);
+  assert.deepEqual(brokenRestrictions(['butter'], 'x', ['Dairy Free', 'nut-free']), ['Dairy Free']);
+  assert.equal(restrictionKey(' Gluten Free '), 'gluten-free');
+  const ok = { title: 'T', ingredients: ['a'], steps: ['s'], tags: ['Thai', 'thai', 'Soup'], prep_minutes: 20 };
+  assert.deepEqual(normalizeParsed(ok), { title: 'T', ingredients: ['a'], steps: ['s'], tags: ['thai', 'soup'], prep_minutes: 20 });
+  assert.equal(normalizeParsed({ ...ok, title: '  ' }), null);
+  assert.equal(normalizeParsed({ ...ok, ingredients: [], steps: [] }), null);
+  assert.notEqual(normalizeParsed({ ...ok, ingredients: [] }), null);
+  assert.equal(normalizeParsed({ ...ok, prep_minutes: -5 })!.prep_minutes, 0);
+  assert.equal(normalizeParsed({ ...ok, prep_minutes: 99_999 })!.prep_minutes, 1440);
+  assert.equal(normalizeParsed({ ...ok, prep_minutes: 'soon' })!.prep_minutes, 0);
+  assert.equal(normalizeParsed({ ...ok, ingredients: Array.from({ length: 100 }, (_, i) => `i${i}`) })!.ingredients.length, 60);
+  assert.equal(normalizeParsed('x'), null);
+  assert.deepEqual(heuristicParse('Soup\nIngredients: a, b\n1. Boil.').ingredients, ['a', 'b']);
+
+  const rec = (id: string, title: string, ingredients: string[], tags: string[]) => ({ record_id: id, title, created_at: `2026-01-0${id.length}`, data: { ingredients, tags } });
+  const veg = suggestMeals({ records: [rec('r1', 'Beef stew', ['beef', 'carrots'], [])], cuisines: [], restrictions: ['vegetarian'] });
+  assert.ok(veg.every((s) => s.title !== 'Beef stew'), 'a saved recipe that breaks a restriction is never offered');
+  const vegan = suggestMeals({ records: [], cuisines: ['thai', 'italian', 'mexican', 'indian'], restrictions: ['vegan'] });
+  assert.ok(vegan.length >= 1);
+  for (const s of vegan) assert.ok(!/chicken|salmon|eggs|parmesan|mozzarella/.test(s.title.toLowerCase()), s.title);
+  const thai = suggestMeals({ records: [], cuisines: ['Thai'], restrictions: [] });
+  assert.equal(thai.length, 3);
+  assert.ok(thai.every((s) => s.tags.includes('thai')), 'preferred-cuisine ideas outrank the generic ones');
+  assert.ok(suggestMeals({ records: [], cuisines: [], restrictions: ['halal'] })[0]!.reason.includes('check it against halal'));
+  const saved = suggestMeals({ records: [rec('r1', 'Mum soup', ['leek'], [])], cuisines: ['thai'], restrictions: [] });
+  assert.equal(saved[0]!.source, 'saved', 'a saved recipe comes before a bought idea');
+});
+
+test('PLAN DAG/SLUG (more): notes are clipped to 400 characters; accents fold', () => {
+  const full = ['context_gather', 'schema_gen', 'code_gen', 'verify_bundle', 'smoke_test', 'package_install'].map((kind) => ({ kind, notes: 'n'.repeat(500) }));
+  assert.ok(acceptDag('micro_app', full).tasks.every((t) => t.notes.length === 400));
+  assert.equal(slugOf('Crème Brûlée Book'), 'creme-brulee-book');
+});
+
+test('PIPELINE (more): long titles are clipped, a raw request is redacted again, own-household paths pass, the manifest cap is kept, base urls are normalized', async () => {
+  const h = await makeHousehold(rt.db);
+  await fund(h, 30);
+  const long = await runGoalCase(h, { script: { plan: { title: 'T'.repeat(200), slug: 'long-title-book', summary: 's', tasks: [] } } });
+  assert.equal(long.outcome.status, 'completed');
+  assert.equal((await fx.one<{ t: string }>('SELECT title AS t FROM micro_apps WHERE goal_id = ?', long.id)).t.length, 80);
+
+  const raw = await runGoalCase(h, { prompt: 'Build me a recipe app for card 4111 1111 1111 1111 holders' });
+  assert.equal(raw.outcome.status, 'completed');
+  assert.ok(raw.rig.model.calls.length >= 3 && raw.rig.model.calls.every((c) => !c.sentText.includes('4111 1111')), 'the planner and writers see the redacted request even when the row is not');
+
+  const own = await runGoalCase(h, { script: { bundles: [inject(`<a href="/apps/${h.household_id}/recipe-book/preview">preview</a>`)] } });
+  assert.equal(own.outcome.status, 'completed', JSON.stringify([own.outcome, await tasks(own.id)]));
+  assert.equal(own.rig.model.count('GOAL-REPAIR'), 0, 'the verifier is told this household, so its own path is fine');
+
+  const capped = await runGoalCase(h, { script: { bundles: [manifest((m) => (m.limits = { monthly_ai_calls_cap: 7 }))] } });
+  assert.equal(capped.outcome.status, 'completed');
+  assert.equal((await fx.one<{ c: number }>('SELECT monthly_ai_calls_cap AS c FROM micro_apps WHERE goal_id = ?', capped.id)).c, 7);
+
+  const rig = goalRig(rt, h);
+  rig.params.base_url = `${BASE}/`;
+  await insertGoal(rt, rig);
+  const slash = await runToEnd(rig, approve(), rt);
+  assert.equal(slash.outcome.status, 'completed');
+  assert.ok(!((await goalRow(rig.params.goal_id))['preview_url'] as string).includes('//apps'));
+  assert.ok(!(slash.outcome as { prod_url: string }).prod_url.includes('//apps'));
+});
+
+test('REPAIR (more): the failing deliverable, the slug, a blocked host and a bad plan all reach the checks; repairs are billed as repairs', async () => {
+  const h = await makeHousehold(rt.db);
+  await fund(h, 20);
+  const marker = await runGoalCase(h, { script: { bundles: [inject('<script>/*MARKER_FAILING_PAGE*/eval("1")</script>'), REF] } });
+  assert.equal(marker.outcome.status, 'completed');
+  assert.ok(marker.rig.model.sent('GOAL-REPAIR')[0]!.includes('MARKER_FAILING_PAGE'), 'the repair prompt carries the failing deliverable');
+  const named = (n: string) => marker.rig.model.calls.filter((c) => JSON.stringify(c.body).includes(n)).length;
+  assert.deepEqual([named('goal_plan'), named('goal_schema'), named('goal_code'), named('goal_repair')], [1, 1, 1, 1], 'a repair is requested as a repair');
+
+  const slug = await runGoalCase(h, { script: { bundles: [manifest((m) => (m.slug = 'not-the-slug')), REF] } });
+  assert.equal(slug.outcome.status, 'completed');
+  assert.ok(slug.rig.model.sent('GOAL-REPAIR')[0]!.includes('SLUG_MISMATCH'));
+
+  const blocked = await runGoalCase(h, { script: { bundles: [inject('<a href="https://resy.com/x">book</a>'), REF] } });
+  assert.equal(blocked.outcome.status, 'completed');
+  assert.ok(blocked.rig.model.sent('GOAL-REPAIR')[0]!.includes('BLOCKLISTED_ORIGIN'));
+
+  const plan = await runGoalCase(h, { tier: 'research_plan', prompt: RESEARCH_PROMPT, script: { research: { title: 'T', summary: 'S', sections: [{ heading: 'Only', body: 'one' }], next_steps: ['x'] } } });
+  assert.deepEqual(plan.outcome, { status: 'failed', code: 'REPAIR_EXHAUSTED' });
+  assert.equal((await tasks(plan.id)).find((t) => t.kind === 'verify_bundle')!.status, 'FAILED');
+  assert.match((await tasks(plan.id)).find((t) => t.kind === 'verify_bundle')!.error_text ?? '', /\[(PLAN_[A-Z_]+|TOO_FEW_SECTIONS)\]/);
+
+  const exhausted = await runGoalCase(h, { script: { bundles: [bad.eval] } });
+  const v = (await tasks(exhausted.id)).find((t) => t.kind === 'verify_bundle')!;
+  assert.deepEqual([v.status, v.retries], ['FAILED', 2]);
+  assert.match(v.error_text ?? '', /\[EVAL\]/);
+});
+
+test('HASHES AND TOKENS: the approval hash covers the goal, bundle and install artifact; the install token is read-only for exactly this app and lasts a year; a halt is cleared before the run', async () => {
+  const h = await makeHousehold(rt.db);
+  await fund(h, 5);
+  const rig = goalRig(rt, h);
+  await insertGoal(rt, rig);
+  const seen: Record<string, unknown> = {};
+  const run = await runToEnd(rig, async () => {
+    const g = await goalRow(rig.params.goal_id);
+    seen['errorCode'] = g['error_code'];
+    seen['notified'] = await count(`SELECT 1 FROM audit_log WHERE household_id = ? AND action = 'push_skipped' AND detail_json LIKE '%goal_ready%'`, h.household_id);
+    const summary = JSON.parse(g['result_summary_json']);
+    seen['hash'] = g['approval_hash'] === (await sha256Hex(canonicalJson({ goal_id: rig.params.goal_id, tier: 'micro_app', bundle_sha256: summary.bundle_sha256, slug: summary.slug, install: JSON.parse(g['install_artifact_json']) })));
+    return approve()(g['approval_hash']);
+  }, rt);
+  assert.equal(run.outcome.status, 'completed');
+  assert.deepEqual(seen, { errorCode: null, notified: 1, hash: true });
+  const g = await goalRow(rig.params.goal_id);
+  const app = await fx.one<{ app_id: string }>('SELECT app_id FROM micro_apps WHERE goal_id = ?', rig.params.goal_id);
+  const art = JSON.parse(g['install_artifact_json']);
+  const token = decodeURIComponent(/\?t=([^"&\s]+)/.exec(art.embed_snippet.iframe)![1]!);
+  const secret = rig.env.SESSION_SECRET;
+  assert.deepEqual(await verifyAppToken(secret, token, new Date()), { household_id: h.household_id, app_id: app.app_id, scope: 'install' });
+  assert.ok((await verifyAppToken(secret, token, new Date(Date.now() + 364 * 86_400_000))) !== null);
+  assert.equal(await verifyAppToken(secret, token, new Date(Date.now() + 366 * 86_400_000)), null);
+  const anchor = await fx.one<{ state: string }>('SELECT state FROM mission_runs WHERE run_id = ?', rig.params.goal_id);
+  assert.equal(anchor.state, 'CANCELED', 'the ledger anchor is inert');
+
+  // research plan: the hash covers the plan, and the member is told
+  await fund(h, 3);
+  const r = goalRig(rt, h);
+  await insertGoal(rt, r, { tier: 'research_plan', prompt: RESEARCH_PROMPT });
+  let rhash = '';
+  await runToEnd(r, (hash: string) => ((rhash = hash), approve()(hash)), rt);
+  const rg = await goalRow(r.params.goal_id);
+  assert.equal(rhash, await sha256Hex(canonicalJson({ goal_id: r.params.goal_id, tier: 'research_plan', plan: JSON.parse(rg['result_summary_json']) })));
+  assert.equal(await count(`SELECT 1 FROM audit_log WHERE household_id = ? AND action = 'push_skipped' AND detail_json LIKE '%goal_ready%'`, h.household_id), 2);
+});
+
+test('PUBLISH REGATE (more): a bundle that stops passing the verifier after staging is not published even though it is byte for byte what was previewed', async () => {
+  const h = await makeHousehold(rt.db);
+  await fund(h, 5);
+  const rig = goalRig(rt, h);
+  await insertGoal(rt, rig);
+  await rt.db.prepare(`DELETE FROM policy_blocklist WHERE domain = 'recipe-book'`).run();
+  try {
+    const run = await runToEnd(rig, async () => {
+      await rt.db.prepare(`INSERT INTO policy_blocklist (domain, reason) VALUES ('recipe-book', 'test')`).run();
+      return approve()((await goalRow(rig.params.goal_id))['approval_hash']);
+    }, rt);
+    assert.deepEqual(run.outcome, { status: 'failed', code: 'REGATE_FAILED' });
+    assert.equal((await buckets(h)).total, 5);
+  } finally {
+    await rt.db.prepare(`DELETE FROM policy_blocklist WHERE domain = 'recipe-book'`).run();
+  }
+});
+
+test('PLANNER OUTPUT: a title or note the redactor would change never reaches a page or a later prompt', async () => {
+  const h = await makeHousehold(rt.db);
+  await fund(h, 5);
+  const r = await runGoalCase(h, { script: { plan: { title: 'Cards 4111 1111 1111 1111', slug: 'cards-book', summary: 'pay 4111 1111 1111 1111', tasks: ['context_gather', 'schema_gen', 'code_gen', 'verify_bundle', 'smoke_test', 'package_install'].map((kind) => ({ kind, notes: 'use card 4111 1111 1111 1111' })) } } });
+  assert.equal(r.outcome.status, 'completed', JSON.stringify(r.outcome));
+  assert.ok(r.rig.model.calls.every((c) => !c.sentText.includes('4111 1111')), 'no later prompt carries it');
+  const app = await fx.one<{ title: string; slug: string }>('SELECT title, slug FROM micro_apps WHERE goal_id = ?', r.id);
+  assert.deepEqual([app.title, app.slug], ['Household app', 'cards-book']);
+  const plan = JSON.parse((await fx.one<{ output_json: string }>(`SELECT output_json FROM goal_tasks WHERE goal_id = ? AND kind = 'decompose'`, r.id)).output_json);
+  assert.equal(plan.summary, '');
+  assert.ok((await tasks(r.id)).every((t) => !t.error_text));
+  assert.ok(!(await fx.one<{ s: string }>(`SELECT group_concat(spec_json) AS s FROM goal_tasks WHERE goal_id = ?`, r.id)).s.includes('4111'));
+});
+
+test('CONTEXT (more): another household\'s spouse is never used', async () => {
+  const other = await makeHousehold(rt.db);
+  const text = 'Zed is married to Quinn.';
+  const ep = await fx.userEpisode(other, text);
+  await writeFact(rt.db, { household_id: other.household_id, source_episode_id: ep, subject: { type: 'person', name: 'Zed' }, predicate: 'spouse_of', object: { type: 'person', name: 'Quinn' }, confidence: 1, quotes: [{ quote: 'married to Quinn', char_start: 7, char_end: 23 }] });
+  const h = await makeHousehold(rt.db);
+  await fund(h, 5);
+  const r = await runGoalCase(h);
+  assert.ok(r.rig.model.sent('GOAL-PLANNER')[0]!.includes('Spouse or partner on record: none'));
+});
+
+test('API (more): approve and decline send goal_approval events; a halted goal from an opted-in household may retry; unknown goal paths do not reach authentication', async () => {
+  const h = await makeHousehold(rt.db);
+  await fund(h, 5);
+  const rig = goalRig(rt, h);
+  await createViaApi(rig, h, WIFE_PROMPT);
+  await runToEnd(rig, async () => {
+    const row = await goalRow(rig.params.goal_id);
+    await api(rig.env, `/api/goals/${rig.params.goal_id}/approve`, h, { body: { approval_hash: row['approval_hash'] } });
+    assert.equal(rig.workflows.goalEvents.at(-1)!.type, `goal_approval:${rig.params.goal_id}`);
+    assert.deepEqual(Object.keys(rig.workflows.goalEvents.at(-1)!.payload as object).sort(), ['approval_hash', 'decision', 'member_id']);
+    return rig.workflows.goalEvents.at(-1)!.payload;
+  }, rt);
+
+  const optIn = await makeHousehold(rt.db);
+  await rt.db.prepare(`UPDATE households SET stripe_customer_id = 'cus_x', stripe_default_payment_method_id = 'pm_x', auto_recharge_enabled = 1, auto_recharge_pack_sku = 'pack_10', auto_recharge_monthly_cap_cents = 2000 WHERE household_id = ?`).bind(optIn.household_id).run();
+  const r2 = goalRig(rt, optIn);
+  await createViaApi(r2, optIn, WIFE_PROMPT);
+  await rt.db.prepare(`UPDATE goals SET status = 'INSUFFICIENT_CREDITS' WHERE goal_id = ?`).bind(r2.params.goal_id).run();
+  assert.equal((await api(r2.env, `/api/goals/${r2.params.goal_id}/retry`, optIn, { body: {} })).status, 202, 'auto-recharge may cover it');
+
+  const { env } = (await import('./helpers/m2')).testEnv(rt);
+  assert.equal((await handleApi(new Request(`${APP_ORIGIN}/api/goals/goal_zz`), env)).status, 404, 'not a goal path, so not even a 401');
+});
+
+test('RUNTIME (more): a missing bundle is a 500, the camera is allowed, quotas and searches are per app, tags match whole, search is capped, expired facts are ignored, the quote is kept', async () => {
+  const live = await liveApp();
+  const h = live.h;
+  const model = makeGoalModel();
+  const f = fetchWith(model);
+  const parse = (l: Live, text: string, slug = SLUG) => hit(l, { path: `/apps/${l.h.household_id}/${slug}/api/parse-recipe`, bearer: l.h, body: { text }, fetch: f });
+  const page = await hit(live, { path: appPath(h), bearer: h });
+  assert.equal(page.headers.get('permissions-policy'), 'camera=(self)');
+
+  // a second app in the same household
+  await fund(h, 5);
+  const second = await runGoalCase(h);
+  assert.equal(second.outcome.status, 'completed');
+  const slug2 = JSON.parse((await goalRow(second.id))['result_summary_json']).slug as string;
+  assert.equal(slug2, 'recipe-book-2');
+  const used = async (goal: string) => (await fx.one<{ n: number }>('SELECT monthly_ai_calls_used AS n FROM micro_apps WHERE goal_id = ?', goal)).n;
+  const first = await parse(live, 'Soup\nIngredients: leek, potato');
+  assert.equal(first.status, 200);
+  assert.ok(((await asJson(first))['record'].data.source_quote as string).length > 0, 'the quote is kept');
+  assert.deepEqual([await used(live.goal_id), await used(second.id)], [1, 0], 'one app\'s reads do not spend the other\'s');
+  const q = async (slug: string, qs: string) => ((await asJson(await hit(live, { path: `/apps/${h.household_id}/${slug}/api/search${qs}`, bearer: h })))['records'] as any[]).length;
+  assert.deepEqual([await q(SLUG, '?q=leek'), await q(slug2, '?q=leek'), await q(SLUG, ''), await q(slug2, '')], [1, 0, 1, 0], 'records belong to one app');
+
+  // whole-tag matching
+  await parse(live, 'Plain Noodles\nIngredients: noodles');
+  const tagged = fetchWith(makeGoalModel({ parse: () => ({ title: 'Tagged', ingredients: ['x1'], steps: ['s'], tags: ['thai'], prep_minutes: 5 }) }));
+  await hit(live, { path: appPath(h, '/api/parse-recipe'), bearer: h, body: { text: 'Tagged\nIngredients: x1' }, fetch: tagged });
+  assert.equal(await q(SLUG, '?tag=thai'), 1);
+  assert.equal(await q(SLUG, '?tag=tha'), 0, 'a tag matches whole, not by prefix');
+
+  // the search cap
+  const at = new Date().toISOString();
+  const stmts = Array.from({ length: 60 }, (_, i) => rt.db.prepare(`INSERT INTO micro_app_records (record_id, app_id, household_id, collection, title, search_tokens, data_json, created_at) VALUES (?, ?, ?, 'recipes', ?, ' bulkitem ', '{"ingredients":[],"steps":[],"tags":[],"prep_minutes":0,"image_r2_key":null,"source_quote":""}', ?)`).bind(`rec_bulk_${i}_${randomUUID().slice(0, 6)}`, live.app_id, h.household_id, `Bulk ${i}`, at));
+  await rt.db.batch(stmts);
+  assert.equal(await q(SLUG, '?q=bulkitem'), 50, 'a search returns at most 50');
+  assert.equal(await q(SLUG, ''), 50);
+
+  // expired facts are not preferences
+  await seedPrefs(h);
+  await rt.db.prepare(`UPDATE facts SET valid_from = '2000-01-01T00:00:00Z', valid_to = '2000-01-02T00:00:00Z' WHERE household_id = ? AND predicate = 'prefers_cuisine'`).bind(h.household_id).run();
+  const sug = await asJson(await hit(live, { path: appPath(h, '/api/suggest'), bearer: h }));
+  assert.deepEqual(sug['used_facts'], { cuisines: [], restrictions: ['gluten-free'] });
+
+  // a missing bundle
+  await rt.bucket.delete((await fx.one<{ k: string }>('SELECT bundle_r2_key AS k FROM micro_apps WHERE goal_id = ?', live.goal_id)).k);
+  const gone = await hit(live, { path: appPath(h), bearer: h });
+  assert.equal(gone.status, 500);
+  assert.equal((await asJson(gone))['error'], 'bundle_missing');
+});
+
+test('MIGRATION (more): task status and quotas are closed sets', async () => {
+  const h = await makeHousehold(rt.db);
+  const at = new Date().toISOString();
+  await rt.db.prepare(`INSERT INTO goals (goal_id, household_id, prompt_text, tier, status, credits_reserved, max_cost_usd, created_at, updated_at) VALUES ('goal_mig2', ?, 'p', 'micro_app', 'PLANNING', 5, 1.25, ?, ?)`).bind(h.household_id, at, at).run();
+  await assert.rejects(rt.db.prepare(`INSERT INTO goal_tasks (task_id, goal_id, seq_no, kind, spec_json, status) VALUES ('t_x', 'goal_mig2', 1, 'code_gen', '{}', 'DONE')`).run(), /constraint/i);
+  await rt.db.prepare(`INSERT INTO micro_apps (app_id, household_id, goal_id, slug, title, bundle_r2_key, manifest_json, status, created_at) VALUES ('app_mig2', ?, 'goal_mig2', 'mig-two', 't', 'k', '{}', 'STAGED', ?)`).bind(h.household_id, at).run();
+  await assert.rejects(rt.db.prepare(`UPDATE micro_apps SET monthly_ai_calls_used = -1 WHERE app_id = 'app_mig2'`).run(), /constraint/i);
+  await assert.rejects(rt.db.prepare(`UPDATE micro_apps SET monthly_ai_calls_cap = -1 WHERE app_id = 'app_mig2'`).run(), /constraint/i);
+});
+
+test('GMAIL (more): the PKCE verifier is sent and hashes to the challenge; a grant with no refresh token stores nothing', async () => {
+  const h = await makeHousehold(rt.db);
+  const { env } = (await import('./helpers/m2')).testEnv(rt, { ENABLE_GMAIL_OAUTH: 'true' });
+  const g = newGoogle();
+  g.scope = _GS;
+  const spy: string[] = [];
+  const inner = fakeGoogle(g);
+  const net = createGuardedFetch({ db: rt.db, fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (typeof init?.body === 'string') spy.push(init.body);
+    return inner(input, init);
+  }) as typeof fetch, ttlMs: 0 });
+  const connect = await authed(env, '/api/auth/google/gmail-connect', h, net);
+  const loc = new URL(connect.headers.get('location')!);
+  const cookie = connect.headers.get('set-cookie')!.split(';')[0]!;
+  const ok = await authed(env, `/api/auth/google/gmail-callback?code=good-code&state=${loc.searchParams.get('state')}`, null, net, { cookie });
+  assert.equal(ok.status, 302);
+  const form = new URLSearchParams(spy.at(-1)!);
+  const verifier = form.get('code_verifier')!;
+  assert.ok(verifier.length >= 43);
+  const challenge = Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))).toString('base64url');
+  assert.equal(challenge, loc.searchParams.get('code_challenge'));
+  assert.notEqual(verifier, loc.searchParams.get('code_challenge'));
+  assert.deepEqual([form.get('grant_type'), form.get('redirect_uri')], ['authorization_code', `${APP_ORIGIN}/api/auth/google/gmail-callback`]);
+
+  const h2 = await makeHousehold(rt.db);
+  g.omitRefreshToken = true;
+  const c2 = await authed(env, '/api/auth/google/gmail-connect', h2, net);
+  const bad = await authed(env, `/api/auth/google/gmail-callback?code=good-code&state=${new URL(c2.headers.get('location')!).searchParams.get('state')}`, null, net, { cookie: c2.headers.get('set-cookie')!.split(';')[0]! });
+  assert.equal(bad.status, 502);
+  assert.equal(await findGmailConnector(rt.db, h2.household_id), null);
 });

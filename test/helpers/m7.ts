@@ -31,6 +31,8 @@ export interface GoalModelScript {
   schemaText?: string;
   plans?: unknown[];
   parse?: (text: string) => unknown;
+  /** What the code model returns for a research plan. */
+  research?: unknown;
 }
 
 export interface GoalModel {
@@ -71,6 +73,7 @@ export function goalModel(script: GoalModelScript = {}): GoalModel {
     }
     if (s.includes('GOAL-SCHEMA')) return openaiReply(script.schemaText ?? { collections: [{ name: 'recipes', fields: ['title', 'ingredients', 'steps', 'tags'] }], ui_notes: 'one page' }, use('schema'));
     if (s.includes('GOAL-CODE. You write a research plan')) {
+      if (script.research !== undefined) return openaiReply(script.research, use('code'));
       return openaiReply({ title: 'College savings plan comparison', summary: 'How to compare the plans.', sections: [{ heading: 'Fees', body: 'Compare expense ratios.' }, { heading: 'State benefits', body: 'Check what each state program offers its residents.' }, { heading: 'Investment menu', body: 'Age-based and static options.' }], next_steps: ['List the plans', 'Compare fees'] }, use('code'));
     }
     if (s.includes('GOAL-CODE') || s.includes('GOAL-REPAIR')) {

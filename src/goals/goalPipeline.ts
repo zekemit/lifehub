@@ -292,7 +292,7 @@ export function acceptDag(tier: GoalTier, proposed: unknown): { tasks: Array<{ k
   if (Array.isArray(proposed)) {
     const items = (proposed as Array<{ kind?: unknown; notes?: unknown }>).filter((t) => t?.kind !== 'decompose');
     if (items.length === canonical.length && items.every((t, i) => t?.kind === canonical[i])) {
-      return { tasks: items.map((t) => ({ kind: t.kind as TaskKind, notes: typeof t.notes === 'string' ? t.notes.slice(0, 400) : '' })), source: 'chief' };
+      return { tasks: items.map((t) => ({ kind: t.kind as TaskKind, notes: typeof t.notes === 'string' && redact(t.notes).redaction_status === 'clean' ? t.notes.slice(0, 400) : '' })), source: 'chief' };
     }
   }
   return { tasks: canonical.map((kind) => ({ kind, notes: '' })), source: 'canonical' };
@@ -336,11 +336,17 @@ async function planDag(deps: GoalDeps, params: GoalExecutionParams): Promise<{ o
       maxOutput: 1500,
     })) as { title?: unknown; slug?: unknown; summary?: unknown; tasks?: unknown };
     const dag = acceptDag(goal.tier, out.tasks);
-    const title = typeof out.title === 'string' && out.title.trim() !== '' ? out.title.replace(/\s+/g, ' ').trim().slice(0, 80) : 'Household app';
+    // the planner's words go into later prompts and onto a page: anything the redactor would change or withhold is replaced, never passed on
+    const clean = (v: unknown): string => {
+      if (typeof v !== 'string') return '';
+      const text = v.replace(/\s+/g, ' ').trim();
+      return redact(text).redaction_status === 'clean' ? text : '';
+    };
+    const title = clean(out.title).slice(0, 80) || 'Household app';
     const taken = new Set((await db.prepare('SELECT slug FROM micro_apps WHERE household_id = ?').bind(goal.household_id).all<{ slug: string }>()).results.map((r) => r.slug));
     let slug = slugOf(typeof out.slug === 'string' ? out.slug : title);
     for (let n = 2; taken.has(slug); n++) slug = `${slugOf(typeof out.slug === 'string' ? out.slug : title).slice(0, 36)}-${n}`;
-    const decompose = { title, slug, summary: typeof out.summary === 'string' ? out.summary.slice(0, 600) : '', dag_source: dag.source };
+    const decompose = { title, slug, summary: clean(out.summary).slice(0, 600), dag_source: dag.source };
     const rows = [
       db.prepare(`INSERT OR IGNORE INTO goal_tasks (task_id, goal_id, seq_no, kind, spec_json, status, output_json) VALUES (?, ?, 0, 'decompose', ?, 'PASSED', ?)`).bind(`tsk_${goal.goal_id}_0`, goal.goal_id, JSON.stringify({ kind: 'decompose' }), JSON.stringify(decompose)),
       ...dag.tasks.map((t, i) =>
@@ -499,9 +505,7 @@ async function execute(deps: GoalDeps, params: GoalExecutionParams): Promise<Exe
       if (attempts >= MAX_REPAIRS) throw new GoalGateError('REPAIR_EXHAUSTED', `still failing after ${MAX_REPAIRS} repairs:\n${trace}`);
       await setTask(db, goal.goal_id, failure.slot.seq, 'FAILED', { error: trace.slice(0, 2000), retry: true });
       await setTask(db, goal.goal_id, codeSlot.seq, 'RUNNING', { retry: true });
-      await moveTo(db, goal, 'EXECUTING', ['VERIFYING', 'EXECUTING'], at()).catch(() => undefined);
-      goal.status = 'EXECUTING';
-      await db.prepare(`UPDATE goals SET status = 'EXECUTING', updated_at = ? WHERE goal_id = ? AND household_id = ?`).bind(at(), goal.goal_id, goal.household_id).run();
+      await moveTo(db, goal, 'EXECUTING', ['VERIFYING', 'EXECUTING'], at());
       try {
         deliverable = await generate(repairSystem(), `REPAIR\nGoal:\n<<<\n${redact(goal.prompt_text).redacted_text ?? ''}\n>>>\nThe failing deliverable:\n${JSON.stringify(deliverable).slice(0, 60_000)}\n\nThe exact problems found (${failure.slot.row.kind}):\n${trace}`);
       } catch (err) {
