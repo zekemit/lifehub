@@ -41,6 +41,7 @@ export interface Env {
   LIFE_RECEIPT_WF: Workflow<LifeReceiptParams>;
   DROP_ALARM_WF: Workflow<DropAlarmParams>;
   PRICE_WATCH_WF: Workflow<PriceWatchParams>;
+  GOAL_EXECUTION_WF: Workflow<GoalExecutionParams>;
   /** Encrypted OAuth tokens (wrangler.toml [[kv_namespaces]]). Values are AES-GCM under the household DEK. */
   KV: KVNamespace;
   /** Secrets (`wrangler secret put`): 32-byte base64 key-encryption key, and the two LLM provider keys. */
@@ -68,6 +69,11 @@ export interface Env {
   STRIPE_WEBHOOK_SECRET?: string;
   /** Duffel search-only API key (secret). Without it price watches check nothing. */
   DUFFEL_API_KEY?: string;
+  /**
+   * Feature flag for the Gmail consent flow ([vars], default "false"). Anything but the string "true" keeps it off: the flow answers
+   * 403 CASA_PENDING before a Google URL is built. Gmail is a restricted scope and waits for CASA AL1 (Claude.md §0, §9).
+   */
+  ENABLE_GMAIL_OAUTH?: string;
   /** Cloudflare Email Sending binding for the weekly Life Receipt. Without it receipts are stored and pushed but not e-mailed. */
   RECEIPT_EMAIL?: EmailSender;
 }
@@ -89,6 +95,17 @@ export interface LifeReceiptParams {
   notify: boolean;
   /** ISO clock override for tests and replays. */
   as_of?: IsoTimestamp;
+}
+
+/**
+ * Payload of a GoalExecutionWF instance. The goals row holds everything else. The first instance's id is the goal id; a restart after a top-up is
+ * `<goal_id>~<attempt>`. `base_url` is the origin the member used (the app links are built from it, so no domain is hardcoded in source).
+ */
+export interface GoalExecutionParams {
+  goal_id: string;
+  household_id: string;
+  attempt: number;
+  base_url: string;
 }
 
 /** Payload of a DropAlarmWF instance. The alarm row holds everything else. */

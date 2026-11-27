@@ -6,7 +6,7 @@
 import { randomUUID } from 'node:crypto';
 import type { InboundMessage } from '../../src/workers/emailRouter';
 import type { StepConfigLike, StepEvent, StepLike } from '../../src/ingest/steps';
-import type { CalendarSyncParams, DropAlarmParams, Env, IngestEmailParams, IngestFileParams, LifeReceiptParams, MissionRunParams, NightlySweepParams, PriceWatchParams } from '../../src/types';
+import type { CalendarSyncParams, DropAlarmParams, Env, GoalExecutionParams, IngestEmailParams, IngestFileParams, LifeReceiptParams, MissionRunParams, NightlySweepParams, PriceWatchParams } from '../../src/types';
 import type { QueryCounter } from './index';
 
 // ── Workflow step (direct execution + accounting) ──
@@ -160,10 +160,13 @@ export interface FakeWorkflows {
   receipt: Array<{ id: string; params: LifeReceiptParams }>;
   alarm: Array<{ id: string; params: DropAlarmParams }>;
   watch: Array<{ id: string; params: PriceWatchParams }>;
+  goal: Array<{ id: string; params: GoalExecutionParams }>;
   /** Events sent to MissionRunWF instances: sendEvent({type, payload}). */
   events: Array<{ id: string; type: string; payload: unknown }>;
   /** Events sent to DropAlarmWF instances. Kept apart so a test can tell WHICH Workflow an event was routed to. */
   alarmEvents: Array<{ id: string; type: string; payload: unknown }>;
+  /** Events sent to GoalExecutionWF instances. */
+  goalEvents: Array<{ id: string; type: string; payload: unknown }>;
 }
 
 /** 32 random bytes, base64. */
@@ -179,7 +182,7 @@ const PROCESS_KEK = randomKek();
  * the real brand or domain would visibly misbehave.
  */
 export function testEnv(rt: { db: D1Database; bucket: R2Bucket; kv?: KVNamespace }, extra: Partial<Env> = {}): { env: Env; workflows: FakeWorkflows } {
-  const workflows: FakeWorkflows = { email: [], file: [], calendar: [], sweep: [], mission: [], receipt: [], alarm: [], watch: [], events: [], alarmEvents: [] };
+  const workflows: FakeWorkflows = { email: [], file: [], calendar: [], sweep: [], mission: [], receipt: [], alarm: [], watch: [], events: [], alarmEvents: [], goal: [], goalEvents: [] };
   const recorder = <P>(list: Array<{ id: string; params: P }>) => ({
     create: async (o: { id: string; params: P }) => {
       if (list.some((w) => w.id === o.id)) throw new Error('instance already exists');
@@ -209,6 +212,7 @@ export function testEnv(rt: { db: D1Database; bucket: R2Bucket; kv?: KVNamespace
     LIFE_RECEIPT_WF: recorder(workflows.receipt),
     DROP_ALARM_WF: { ...recorder(workflows.alarm), get: eventTarget(workflows.alarmEvents) },
     PRICE_WATCH_WF: recorder(workflows.watch),
+    GOAL_EXECUTION_WF: { ...recorder(workflows.goal), get: eventTarget(workflows.goalEvents) },
     KV: rt.kv,
     GOOGLE_CLIENT_ID: 'client-id.apps.test',
     GOOGLE_CLIENT_SECRET: 'client-secret',

@@ -14,6 +14,8 @@ enabled = true
 [vars]
 APP_NAME = "Hayes"
 INBOUND_DOMAIN = "in.askhayes.com"
+# Gmail consent flow (restricted scope; waits for CASA AL1). Only the string "true" turns it on; otherwise GET /api/auth/google/gmail-connect answers 403 CASA_PENDING.
+ENABLE_GMAIL_OAUTH = "false"
 
 # Durable ingestion pipelines (classes are exported from src/index.ts).
 [[workflows]]
@@ -55,6 +57,12 @@ class_name = "DropAlarmWF"
 name = "price-watch"
 binding = "PRICE_WATCH_WF"
 class_name = "PriceWatchWF"
+
+# Autonomous goals: plan, build, verify, stage a preview, wait for the member's approval, publish.
+[[workflows]]
+name = "goal-execution"
+binding = "GOAL_EXECUTION_WF"
+class_name = "GoalExecutionWF"
 
 # Hourly. src/workers/scheduled.ts starts the nightly chain only for households whose local time is 03:00.
 [triggers]
